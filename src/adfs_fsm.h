@@ -3,9 +3,7 @@
     adfs_fsm.h
 
     vfs-verifier - Acorn VFS (Domesday) image verifier
-    Copyright (C) 2025 Simon Inns
-
-    This file is part of ld-decode-tools.
+    Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
     modify it under the terms of the GNU General Public License as
@@ -36,16 +34,33 @@ class AdfsFsm
 public:
     AdfsFsm(const std::vector<uint8_t>& sectors);
 
-    uint32_t size() const { return m_freeSpaceMap.size(); }
+    bool isValid() const { return m_isValid; }
+
+    uint32_t size() const { return static_cast<uint32_t>(m_freeSpaceMap.size()); }
     uint32_t freeSpace(uint32_t index) const { return m_freeSpaceMap.at(index); }
     uint32_t freeSpaceLength(uint32_t index) const { return m_freeSpaceLengths.at(index); }
 
+    // Disc geometry and identification
+    uint32_t numberOfSectors() const { return m_numberOfSectors; }
+    uint16_t discId() const { return m_discId; }
+    uint8_t bootOption() const { return m_bootOption; }
+    std::string discName() const { return m_RiscOsDiscName; }
+
+    // Allocation totals, in ADFS sectors
+    uint32_t freeSectors() const;
+    uint32_t usedSectors() const;
+
+    // True if the given ADFS sector lies within one of the free space extents
+    bool isFree(uint32_t adfsSector) const;
+
 private:
+    bool m_isValid;
     std::vector<uint32_t> m_freeSpaceMap;
     std::vector<uint32_t> m_freeSpaceLengths;
     std::string m_RiscOsDiscName;
     uint16_t m_discId;
     uint32_t m_numberOfSectors;
+    uint8_t m_bootOption;
     uint8_t m_lengthOfFreeSpaceMap;
 
     void showStarFree();

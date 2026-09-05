@@ -1,0 +1,7 @@
+# Build output
+build/
+build-*/
+
+# Nix
+result
+result-*

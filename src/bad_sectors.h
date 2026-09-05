@@ -3,9 +3,7 @@
     bad_sectors.h
 
     vfs-verifier - Acorn VFS (Domesday) image verifier
-    Copyright (C) 2025 Simon Inns
-
-    This file is part of ld-decode-tools.
+    Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
     modify it under the terms of the GNU General Public License as
@@ -25,7 +23,7 @@
 #ifndef BAD_SECTORS_H
 #define BAD_SECTORS_H
 
-#include <vector>
+#include <set>
 #include <fstream>
 #include <string>
 #include <cstdint>
@@ -40,10 +38,20 @@ public:
 
     bool isSectorBad(uint32_t sector) const;
 
+    // The complete set of bad EFM sectors, in ascending order
+    const std::set<uint32_t>& sectors() const { return m_badSectors; }
+    size_t count() const { return m_badSectors.size(); }
+
+    // Number of duplicate and malformed lines seen when the map was read
+    uint32_t duplicateLines() const { return m_duplicateLines; }
+    uint32_t malformedLines() const { return m_malformedLines; }
+
 private:
-    std::vector<uint32_t> m_badSectors;
+    std::set<uint32_t> m_badSectors;
     std::ifstream m_file;
     bool m_isOpen;
+    uint32_t m_duplicateLines;
+    uint32_t m_malformedLines;
 };
 
 #endif // BAD_SECTORS_H

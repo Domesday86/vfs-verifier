@@ -3,9 +3,7 @@
     adfs_fsm.cpp
 
     vfs-verifier - Acorn VFS (Domesday) image verifier
-    Copyright (C) 2025 Simon Inns
-
-    This file is part of ld-decode-tools.
+    Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
     modify it under the terms of the GNU General Public License as
@@ -25,7 +23,12 @@
 #include "adfs_fsm.h"
 #include "logging.h"
 
-AdfsFsm::AdfsFsm(const std::vector<uint8_t>& sectors)
+AdfsFsm::AdfsFsm(const std::vector<uint8_t>& sectors) :
+    m_isValid(false),
+    m_discId(0),
+    m_numberOfSectors(0),
+    m_bootOption(0),
+    m_lengthOfFreeSpaceMap(0)
 {
     // Expecting 2 sectors of data 2*256 bytes
     if (sectors.size() != 512) {
@@ -43,12 +46,20 @@ AdfsFsm::AdfsFsm(const std::vector<uint8_t>& sectors)
     // Each free space is 3 bytes. (Maximum of 82 entries)
     // The length of each free space is from 0x00 to 0xF5 inclusive (sector 1)
     // Each free space length is 3 bytes.
+    if (m_lengthOfFreeSpaceMap > 0xF6) {
+        LOG_WARN("AdfsFsm::AdfsFsm() - Free space map end pointer {} is out of range - "
+                 "the free space map may be corrupt", m_lengthOfFreeSpaceMap);
+        m_lengthOfFreeSpaceMap = 0xF6;
+    }
+
     for (int i = 0; i < m_lengthOfFreeSpaceMap; i += 3) {
         m_freeSpaceMap.push_back(get24(sectors, i));
         m_freeSpaceLengths.push_back(get24(sectors, 0x100 + i));
     }
 
-    // Interleave the odd and even characters to get the RISC OS disc name
+    // Interleave the odd and even characters to get the RISC OS disc name.
+    // Note: the exact extent of the name field is not verified by this tool -
+    // the discs seen so far leave it blank.
     m_RiscOsDiscName.clear();
     for (int i = 0xF6; i <= 0xFB; i++) {
         m_RiscOsDiscName += static_cast<char>(sectors.at(i));
@@ -57,28 +68,61 @@ AdfsFsm::AdfsFsm(const std::vector<uint8_t>& sectors)
         }
     }
 
+    // Trim padding so that a blank name reads as blank rather than as control characters
+    while (!m_RiscOsDiscName.empty()) {
+        const unsigned char c = static_cast<unsigned char>(m_RiscOsDiscName.back());
+        if (c == 0x00 || c == 0x0D || c == ' ') m_RiscOsDiscName.pop_back();
+        else break;
+    }
+
     // The total number of sectors is 0xFC to 0xFE inclusive (sector 0)
     m_numberOfSectors = get24(sectors, 0x0FC);
 
     // The disc ID is 0xFB to 0xFC inclusive (sector 1)
     m_discId = get16(sectors, 0x1FB);
 
+    // The boot option is 0xFD (sector 1)
+    m_bootOption = get8(sectors, 0x1FD);
+
+    m_isValid = true;
     show();
+}
+
+uint32_t AdfsFsm::freeSectors() const
+{
+    uint32_t total = 0;
+    for (size_t i = 0; i < m_freeSpaceLengths.size(); ++i) {
+        total += m_freeSpaceLengths.at(i);
+    }
+    return total;
+}
+
+uint32_t AdfsFsm::usedSectors() const
+{
+    const uint32_t free = freeSectors();
+    if (free > m_numberOfSectors) return 0;
+    return m_numberOfSectors - free;
+}
+
+bool AdfsFsm::isFree(uint32_t adfsSector) const
+{
+    for (size_t i = 0; i < m_freeSpaceMap.size(); ++i) {
+        const uint32_t start = m_freeSpaceMap.at(i);
+        const uint32_t length = m_freeSpaceLengths.at(i);
+        if (adfsSector >= start && adfsSector < start + length) return true;
+    }
+    return false;
 }
 
 void AdfsFsm::showStarFree()
 {
-    // Calculate and show the number of used and free sectors
-    uint32_t usedSectors = 0;
-    for (size_t i = 0; i < m_freeSpaceLengths.size(); ++i) {
-        usedSectors += m_freeSpaceLengths.at(i);
-    }
-
-    uint32_t freeSectors = m_numberOfSectors - usedSectors;
+    // Show the number of free and used sectors, as the Acorn *FREE command does
+    const uint32_t free = freeSectors();
+    const uint32_t used = usedSectors();
 
     LOG_DEBUG("*FREE");
-    LOG_DEBUG(" {}={} Bytes Free", toString24bits(usedSectors), usedSectors * 256);
-    LOG_DEBUG(" {}={} Bytes Used", toString24bits(freeSectors), freeSectors * 256);
+    LOG_DEBUG(" {}={} Bytes Free", toString24bits(free), static_cast<uint64_t>(free) * 256);
+    LOG_DEBUG(" {}={} Bytes Used", toString24bits(used), static_cast<uint64_t>(used) * 256);
 }
 
 void AdfsFsm::showStarMap()
@@ -95,4 +139,3 @@ void AdfsFsm::show()
     showStarFree();
     showStarMap();
 }
-

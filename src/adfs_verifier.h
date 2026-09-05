@@ -3,9 +3,7 @@
     adfs_verifier.h
 
     vfs-verifier - Acorn VFS (Domesday) image verifier
-    Copyright (C) 2025 Simon Inns
-
-    This file is part of ld-decode-tools.
+    Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
     modify it under the terms of the GNU General Public License as
@@ -27,24 +25,70 @@
 
 #include <string>
 #include <vector>
+#include <set>
 #include <cstdint>
 
 #include "adfs_image.h"
 #include "adfs_fsm.h"
 #include "adfs_directory.h"
-#include "adfs_filecheck.h"
+#include "adfs_content.h"
 #include "bad_sectors.h"
 
 class AdfsVerifier
 {
 public:
     AdfsVerifier();
-    
+
     bool process(const std::string &filename, const std::string &bsmFilename);
 
+    // True if the image completed verification with no damage to file data
+    bool verificationPassed() const { return m_verificationPassed; }
+
 private:
+    // The damage sustained by a single object in the directory
+    struct ObjectDamage {
+        std::string name;
+        uint32_t startSector;
+        uint32_t sectorLength;
+        uint32_t byteLength;
+        uint32_t damagedEfmSectors;
+        uint64_t damagedBytes;
+        bool extendsPastEndOfImage;
+    };
+
+    // The content measured for each object, in the same order as the damage list
+    struct ObjectContentReport {
+        std::string name;
+        ObjectContent content;
+    };
+
+    // How each entry in the bad sector map relates to the filesystem
+    struct MapAnalysis {
+        uint32_t beforeFilesystem;
+        uint32_t withinFileData;
+        uint32_t filesystemMetadata;
+        uint32_t allocatedButUnlisted;
+        uint32_t freeSpace;
+        uint32_t pastEndOfImage;
+    };
+
     AdfsImage m_image;
-    void hexDump(std::vector<uint8_t> &data, int32_t startSector) const;
+    bool m_verificationPassed;
+
+    std::set<uint32_t> metadataEfmSectors() const;
+
+    void reportFilesystemLocation() const;
+    void reportMetadataIntegrity(const AdfsFsm &fsm, const AdfsDirectory &directory,
+                                 const BadSectors &badSectors, bool fsmChecksumOk,
+                                 bool fsmReadComplete, bool directoryReadComplete);
+    void reportImageGeometry(const AdfsFsm &fsm) const;
+    void reportObjectDamage(const std::vector<ObjectDamage> &damage) const;
+    void reportMapAnalysis(const MapAnalysis &analysis, const BadSectors &badSectors) const;
+    void reportObjectContent(const std::vector<ObjectContentReport> &content) const;
+    void reportBoundaryCheck(const std::vector<BoundaryCheck> &checks) const;
+    void reportAllocationCrossCheck(const AdfsFsm &fsm, const AdfsDirectory &directory) const;
+
+    void hexDump(const std::vector<uint8_t> &data, uint32_t startSector) const;
 };
 
 #endif // ADFS_VERIFIER_H

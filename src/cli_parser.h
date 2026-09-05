@@ -3,9 +3,7 @@
     cli_parser.h
 
     Simple command-line argument parser (replaces QCommandLineParser)
-    Copyright (C) 2025 Simon Inns
-
-    This file is part of EFM-Tools.
+    Copyright (C) 2025-2026 Simon Inns
 
     This is free software: you can redistribute it and/or
     modify it under the terms of the GNU General Public License as

@@ -3,9 +3,7 @@
     logging.h
 
     vfs-verifier - Centralized logging using spdlog
-    Copyright (C) 2025 Simon Inns
-
-    This file is part of ld-decode-tools.
+    Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
     modify it under the terms of the GNU General Public License as
@@ -137,7 +135,7 @@ inline void setLogLevel(spdlog::level::level_enum level)
 }
 
 // Utility function to set binary mode on stdin/stdout (Windows compatibility)
-inline void setBinaryMode(bool enable = true) {
+inline void setBinaryMode([[maybe_unused]] bool enable = true) {
 #ifdef _WIN32
     if (enable) {
         _setmode(_fileno(stdin), _O_BINARY);

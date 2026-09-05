@@ -3,9 +3,7 @@
     adfs_directory.cpp
 
     vfs-verifier - Acorn VFS (Domesday) image verifier
-    Copyright (C) 2025 Simon Inns
-
-    This file is part of ld-decode-tools.
+    Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
     modify it under the terms of the GNU General Public License as
@@ -25,7 +23,25 @@
 #include "adfs_directory.h"
 #include "logging.h"
 
-AdfsDirectoryEntry::AdfsDirectoryEntry(const std::vector<uint8_t>& data)
+// Strings in directories are terminated with 0x0D or 0x00 if shorter than the
+// field, they are not space padded as with most other filesystems.
+static std::string trimAcornString(const std::vector<uint8_t>& data, size_t offset, size_t maxLength)
+{
+    std::string result;
+    for (size_t i = 0; i < maxLength; ++i) {
+        const uint8_t c = data.at(offset + i) & 0x7F;
+        if (c == 0x00 || c == 0x0D) break;
+        result += static_cast<char>(c);
+    }
+    while (!result.empty() && result.back() == ' ') result.pop_back();
+    return result;
+}
+
+AdfsDirectoryEntry::AdfsDirectoryEntry(const std::vector<uint8_t>& data) :
+    m_readable(false), m_writable(false), m_locked(false), m_directory(false),
+    m_executeOnly(false), m_publiclyReadable(false), m_publiclyWritable(false),
+    m_publiclyExecuteOnly(false), m_private(false), m_endOfDirectory(true),
+    m_loadAddress(0), m_execAddress(0), m_byteLength(0), m_startSector(0), m_sequenceNumber(0)
 {
     // Expecting 26 bytes of data (0x00 to 0x19)
     if (data.size() != 26) {
@@ -54,13 +70,12 @@ AdfsDirectoryEntry::AdfsDirectoryEntry(const std::vector<uint8_t>& data)
     // 016-018 	Start sector/allocation number
     // 019		Sequence number on small-sector disks
 
-    // Object name
-    // Create a copy of the data with the MSB masked off
-    std::vector<uint8_t> objectNameData(data.begin(), data.begin() + 10);
-    for (size_t i = 0; i < objectNameData.size(); ++i) {
-        objectNameData[i] = objectNameData[i] & 0x7F;
-    }
-    m_objectName = std::string(objectNameData.begin(), objectNameData.end());
+    // A zero first character of the object name marks the end of the directory
+    m_endOfDirectory = ((data.at(0) & 0x7F) == 0x00);
+    if (m_endOfDirectory) return;
+
+    // Object name, with the access bits masked off
+    m_objectName = trimAcornString(data, 0, 10);
 
     // Flags
     m_readable = (data.at(0) & 0x80) != 0;
@@ -89,7 +104,7 @@ AdfsDirectoryEntry::AdfsDirectoryEntry(const std::vector<uint8_t>& data)
     m_sequenceNumber = get8(data, 0x19);
 };
 
-void AdfsDirectoryEntry::show()
+std::string AdfsDirectoryEntry::flagString() const
 {
     std::string flags = "";
     if (m_directory) flags += "D";
@@ -101,19 +116,30 @@ void AdfsDirectoryEntry::show()
     if (m_publiclyWritable) flags += "w";
     if (m_publiclyExecuteOnly) flags += "e";
     if (m_private) flags += "P";
+    return flags;
+}
 
+void AdfsDirectoryEntry::show()
+{
     // Pad the object name to 10 characters
     std::string paddedObjectName = m_objectName;
     while (paddedObjectName.size() < 10) {
         paddedObjectName += " ";
     }
 
-    LOG_INFO("  {} {} ({:02d}) {} {} {} {}", paddedObjectName, flags, m_sequenceNumber, 
-        toString32bits(m_loadAddress), toString32bits(m_execAddress), 
+    LOG_INFO("  {} {} ({:02d}) {} {} {} {}", paddedObjectName, flagString(), m_sequenceNumber,
+        toString32bits(m_loadAddress), toString32bits(m_execAddress),
         toString32bits(m_byteLength), toString24bits(m_startSector));
 }
 
-AdfsDirectory::AdfsDirectory(const std::vector<uint8_t>& sectors)
+AdfsDirectory::AdfsDirectory(const std::vector<uint8_t>& sectors) :
+    m_isValid(false),
+    m_broken(true),
+    m_entriesTerminated(false),
+    m_masterSequenceNumber(0),
+    m_headerSequenceNumber(0),
+    m_footerSequenceNumber(0),
+    m_parentStartSector(0)
 {
     // Expecting 5 sectors of data 5*256 bytes
     if (sectors.size() != 1280) {
@@ -136,25 +162,13 @@ AdfsDirectory::AdfsDirectory(const std::vector<uint8_t>& sectors)
     // 001-004 	Directory identifier "Hugo"
 
     // Get the Master Sequence Number
-    uint8_t msnBcd = static_cast<uint8_t>(sectors.at(0));
+    m_headerSequenceNumber = static_cast<uint8_t>(sectors.at(0));
 
     // Convert the BCD to a number
-    m_masterSequenceNumber = ((msnBcd >> 4) * 10) + (msnBcd & 0x0F);
+    m_masterSequenceNumber = static_cast<uint8_t>(((m_headerSequenceNumber >> 4) * 10) +
+                                                  (m_headerSequenceNumber & 0x0F));
 
-    // Read the 47 directory entries
-    LOG_INFO("Directory entries:");
-    for (int i = 0; i < 47; ++i) {
-        std::vector<uint8_t> entryData(sectors.begin() + 5 + (i * 26), sectors.begin() + 5 + ((i + 1) * 26));
-        AdfsDirectoryEntry entry(entryData);
-
-        // End of directory entries?
-        if (entry.sequenceNumber() == 0) {
-            break;
-        }
-
-        entry.show();
-        m_adfsDirectoryEntries.push_back(entry);
-    }
+    for (int i = 0; i < 4; ++i) m_headerIdentifier += static_cast<char>(sectors.at(0x001 + i));
 
     // Small directory footer:
     // 4CB       &00 - marks end of directory
@@ -168,9 +182,39 @@ AdfsDirectory::AdfsDirectory(const std::vector<uint8_t>& sectors)
     //             if it is zero it is ignored. 8-bit ADFS always ignores it,
     //             and writes it as a zero.
 
+    m_directoryName = trimAcornString(sectors, 0x4CC, 10);
+    m_parentStartSector = get24(sectors, 0x4D6);
+    m_directoryTitle = trimAcornString(sectors, 0x4D9, 19);
+    m_footerSequenceNumber = static_cast<uint8_t>(sectors.at(0x4FA));
+    for (int i = 0; i < 4; ++i) m_footerIdentifier += static_cast<char>(sectors.at(0x4FB + i));
+
     // A directory is reported as 'Broken' if the Master Sequence Number and
     // "Hugo"/"Nick" strings do not match - bytes &000-&004 are compared with bytes
     // &4FA-&4FE.
+    m_broken = (m_headerSequenceNumber != m_footerSequenceNumber) ||
+               (m_headerIdentifier != m_footerIdentifier);
+
+    // Read the directory entries. The final directory entry is followed by a
+    // &00 byte; in a full directory this &00 byte is the byte at &4CB.
+    LOG_INFO("Directory entries:");
+    for (int i = 0; i < 47; ++i) {
+        std::vector<uint8_t> entryData(sectors.begin() + 5 + (i * 26), sectors.begin() + 5 + ((i + 1) * 26));
+        AdfsDirectoryEntry entry(entryData);
+
+        // End of directory entries?
+        if (entry.isEndOfDirectory()) {
+            m_entriesTerminated = true;
+            break;
+        }
+
+        entry.show();
+        m_adfsDirectoryEntries.push_back(entry);
+    }
+
+    // A directory holding all 47 entries is terminated by the &00 at &4CB instead
+    if (!m_entriesTerminated && sectors.at(0x4CB) == 0x00) {
+        m_entriesTerminated = true;
+    }
 
     // Strings in directories are terminated with &0D or &00 if shorter than ten
     // characters, they are not space padded as with most other filesystems.
@@ -179,8 +223,7 @@ AdfsDirectory::AdfsDirectory(const std::vector<uint8_t>& sectors)
     // order. If objects are not sorted, then mis-sorted entries will not be found
     // by filing system operations.
 
-    // The final directory entry is followed by a &00 byte, in a full directory
-    // this &00 byte is the byte at &4CB/&7D7.
+    m_isValid = true;
 }
 
 std::vector<AdfsDirectoryEntry> AdfsDirectory::entries() const
@@ -190,5 +233,7 @@ std::vector<AdfsDirectoryEntry> AdfsDirectory::entries() const
 
 void AdfsDirectory::show()
 {
-    LOG_DEBUG("AdfsDirectory::show() - Showing directory");
+    LOG_DEBUG("AdfsDirectory::show() - Directory \"{}\" title \"{}\" master sequence number {} - {}",
+        m_directoryName, m_directoryTitle, m_masterSequenceNumber,
+        m_broken ? "BROKEN" : "consistent");
 }

@@ -3,9 +3,7 @@
     adfs_directory.h
 
     vfs-verifier - Acorn VFS (Domesday) image verifier
-    Copyright (C) 2025 Simon Inns
-
-    This file is part of ld-decode-tools.
+    Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
     modify it under the terms of the GNU General Public License as
@@ -52,7 +50,14 @@ public:
     uint32_t byteLength() const { return m_byteLength; }
     uint32_t startSector() const { return m_startSector; }
     uint8_t sequenceNumber() const { return m_sequenceNumber; }
-    
+
+    // A zero first byte of the object name marks the end of the directory
+    bool isEndOfDirectory() const { return m_endOfDirectory; }
+
+    // The number of whole ADFS sectors occupied by this object
+    uint32_t sectorLength() const { return (m_byteLength + 255) / 256; }
+
+    std::string flagString() const;
     void show();
 
 private:
@@ -66,6 +71,7 @@ private:
     bool m_publiclyWritable;
     bool m_publiclyExecuteOnly;
     bool m_private;
+    bool m_endOfDirectory;
 
     uint32_t m_loadAddress;
     uint32_t m_execAddress;
@@ -81,13 +87,39 @@ public:
 
     std::vector<AdfsDirectoryEntry> entries() const;
 
+    bool isValid() const { return m_isValid; }
+
+    // A directory is "broken" if the master sequence number and identifier in
+    // the header do not match those in the footer
+    bool isBroken() const { return m_broken; }
+
+    uint8_t headerSequenceNumber() const { return m_headerSequenceNumber; }
+    uint8_t footerSequenceNumber() const { return m_footerSequenceNumber; }
+    std::string headerIdentifier() const { return m_headerIdentifier; }
+    std::string footerIdentifier() const { return m_footerIdentifier; }
+    std::string directoryName() const { return m_directoryName; }
+    std::string directoryTitle() const { return m_directoryTitle; }
+    uint32_t parentStartSector() const { return m_parentStartSector; }
+
+    // True if the entries were correctly terminated within the directory
+    bool entriesTerminated() const { return m_entriesTerminated; }
+
     void show();
 
 private:
     std::vector<AdfsDirectoryEntry> m_adfsDirectoryEntries;
 
-    int8_t m_masterSequenceNumber;
-
+    bool m_isValid;
+    bool m_broken;
+    bool m_entriesTerminated;
+    uint8_t m_masterSequenceNumber;
+    uint8_t m_headerSequenceNumber;
+    uint8_t m_footerSequenceNumber;
+    std::string m_headerIdentifier;
+    std::string m_footerIdentifier;
+    std::string m_directoryName;
+    std::string m_directoryTitle;
+    uint32_t m_parentStartSector;
 };
 
 #endif // ADFS_DIRECTORY_H
