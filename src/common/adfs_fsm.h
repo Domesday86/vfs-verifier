@@ -2,7 +2,7 @@
 
     adfs_fsm.h
 
-    vfs-verifier - Acorn VFS (Domesday) image verifier
+    vfs-tools - Acorn VFS (Domesday) image tools
     Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or

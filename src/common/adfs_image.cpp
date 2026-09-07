@@ -2,7 +2,7 @@
 
     adfs_image.cpp
 
-    vfs-verifier - Acorn VFS (Domesday) image verifier
+    vfs-tools - Acorn VFS (Domesday) image tools
     Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
@@ -43,17 +43,27 @@ AdfsImage::AdfsImage() :
 bool AdfsImage::open(const std::string& filename)
 {
     // Open the input file
-    m_file.open(filename, std::ios::in | std::ios::binary);
-    if (!m_file.is_open()) {
+    auto reader = std::make_unique<FileImageReader>();
+    if (!reader->open(filename)) {
         LOG_CRITICAL("AdfsImage::open() - Could not open file {} for reading", filename);
         return false;
     }
 
+    return attach(std::move(reader));
+}
+
+bool AdfsImage::attach(std::unique_ptr<ImageReader> reader)
+{
+    m_reader = std::move(reader);
+    if (!m_reader) {
+        LOG_CRITICAL("AdfsImage::attach() - No image reader was supplied");
+        return false;
+    }
+
     // Determine the size of the image
-    m_file.seekg(0, std::ios::end);
-    m_imageSize = static_cast<uint64_t>(m_file.tellg());
-    m_file.seekg(0, std::ios::beg);
-    LOG_DEBUG("AdfsImage::open() - Opened file {} for reading ({} bytes)", filename, m_imageSize);
+    m_imageSize = m_reader->size();
+    LOG_DEBUG("AdfsImage::attach() - Opened {} for reading ({} bytes)",
+        m_reader->description(), m_imageSize);
 
     m_isValid = true;
 
@@ -65,9 +75,9 @@ bool AdfsImage::open(const std::string& filename)
 
 void AdfsImage::close()
 {
-    if (m_file.is_open()) {
-        LOG_DEBUG("AdfsImage::close() - Closed file");
-        m_file.close();
+    if (m_reader) {
+        LOG_DEBUG("AdfsImage::close() - Closed {}", m_reader->description());
+        m_reader.reset();
     }
 }
 
@@ -84,30 +94,17 @@ std::vector<uint8_t> AdfsImage::readRaw(uint64_t offset, size_t length)
 {
     std::vector<uint8_t> buffer;
 
-    if (!m_file.is_open()) {
-        LOG_CRITICAL("AdfsImage::readRaw() - File is not open");
-        return buffer;
-    }
-
-    // Clear any error state left by a previous read before seeking
-    m_file.clear();
-    m_file.seekg(static_cast<std::streamoff>(offset));
-    if (!m_file.good()) {
-        LOG_WARN("AdfsImage::readRaw() - Could not seek to offset {} (image is {} bytes)",
-            offset, m_imageSize);
-        m_file.clear();
+    if (!m_reader) {
+        LOG_CRITICAL("AdfsImage::readRaw() - No image is open");
         return buffer;
     }
 
     buffer.resize(length);
-    m_file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(length));
+    const size_t bytesRead = m_reader->read(offset, buffer.data(), length);
 
-    const size_t bytesRead = static_cast<size_t>(m_file.gcount());
     if (bytesRead != length) {
-        // Short read - truncate the buffer to what was actually available and
-        // clear the stream so that subsequent reads still work
+        // Short read - truncate the buffer to what was actually available
         buffer.resize(bytesRead);
-        m_file.clear();
     }
 
     return buffer;
@@ -176,19 +173,15 @@ std::vector<uint64_t> AdfsImage::findSignatureCandidates()
 {
     std::vector<uint64_t> candidates;
 
+    if (!m_reader) return candidates;
+
     const size_t chunkSize = 1024 * 1024;
     const size_t overlap = 3;   // so a signature spanning a chunk boundary is still found
-    std::vector<char> chunk(chunkSize);
+    std::vector<uint8_t> chunk(chunkSize);
     uint64_t chunkStart = 0;
 
-    m_file.clear();
-    m_file.seekg(0, std::ios::beg);
-
     while (chunkStart < m_imageSize && candidates.size() < MAX_SIGNATURE_CANDIDATES) {
-        m_file.clear();
-        m_file.seekg(static_cast<std::streamoff>(chunkStart));
-        m_file.read(chunk.data(), static_cast<std::streamsize>(chunkSize));
-        const size_t bytesRead = static_cast<size_t>(m_file.gcount());
+        const size_t bytesRead = m_reader->read(chunkStart, chunk.data(), chunkSize);
         if (bytesRead == 0) break;
 
         for (size_t i = 0; i + 4 <= bytesRead; ++i) {
@@ -202,7 +195,6 @@ std::vector<uint64_t> AdfsImage::findSignatureCandidates()
         chunkStart += bytesRead - overlap;
     }
 
-    m_file.clear();
     return candidates;
 }
 

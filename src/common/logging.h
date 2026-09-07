@@ -2,7 +2,7 @@
 
     logging.h
 
-    vfs-verifier - Centralized logging using spdlog
+    vfs-tools - Centralized logging using spdlog
     Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or

@@ -38,16 +38,6 @@ AdfsVerifier::AdfsVerifier() :
     m_verificationPassed(false)
 {}
 
-// The EFM sectors that hold the free space map and the root directory
-std::set<uint32_t> AdfsVerifier::metadataEfmSectors() const
-{
-    std::set<uint32_t> sectors;
-    for (uint32_t s = 0; s < METADATA_SECTORS; ++s) {
-        sectors.insert(m_image.adfsSectorToEfmSector(s));
-    }
-    return sectors;
-}
-
 void AdfsVerifier::reportFilesystemLocation() const
 {
     LOG_INFO("Filesystem location:");
@@ -63,10 +53,14 @@ void AdfsVerifier::reportFilesystemLocation() const
     }
 }
 
-void AdfsVerifier::reportMetadataIntegrity(const AdfsFsm &fsm, const AdfsDirectory &directory,
-                                           const BadSectors &badSectors, bool fsmChecksumOk,
-                                           bool fsmReadComplete, bool directoryReadComplete)
+void AdfsVerifier::reportMetadataIntegrity(const VfsMap &map, const BadSectors &badSectors)
 {
+    const AdfsFsm &fsm = map.fsm();
+    const AdfsDirectory &directory = map.directory();
+    const bool fsmChecksumOk = map.fsmChecksumOk();
+    const bool fsmReadComplete = map.fsmReadComplete();
+    const bool directoryReadComplete = map.directoryReadComplete();
+
     LOG_INFO("Filesystem metadata:");
 
     // Free space map sectors 0 and 1
@@ -109,7 +103,7 @@ void AdfsVerifier::reportMetadataIntegrity(const AdfsFsm &fsm, const AdfsDirecto
     }
 
     // Are the metadata sectors themselves listed as bad?
-    const std::set<uint32_t> metadata = metadataEfmSectors();
+    const std::set<uint32_t> &metadata = map.metadataEfmSectors();
     std::vector<uint32_t> badMetadata;
     for (uint32_t efmSector : metadata) {
         if (badSectors.isSectorBad(efmSector)) badMetadata.push_back(efmSector);
@@ -365,84 +359,64 @@ bool AdfsVerifier::process(const std::string &filename, const std::string &bsmFi
     reportFilesystemLocation();
     if (!m_image.locatedByValidation()) m_verificationPassed = false;
 
-    // Read the free space map
-    std::vector<uint8_t> fsmData = m_image.readSectors(0, 2, true);
-    const bool fsmChecksumOk = m_image.lastChecksumOk();
-    const bool fsmReadComplete = m_image.lastReadComplete();
-    AdfsFsm adfsFsm(fsmData);
+    // Read the free space map and the root directory
+    VfsMap map;
+    if (!map.load(m_image)) {
+        LOG_CRITICAL("AdfsVerifier::process() - Could not read the filesystem of VFS image file {}",
+            filename);
+        return false;
+    }
 
-    // Read the root directory
-    std::vector<uint8_t> dirData = m_image.readSectors(2, 5, false);
-    const bool dirReadComplete = m_image.lastReadComplete();
-    AdfsDirectory adfsDirectory(dirData);
+    const AdfsFsm &adfsFsm = map.fsm();
+    const AdfsDirectory &adfsDirectory = map.directory();
 
-    reportMetadataIntegrity(adfsFsm, adfsDirectory, badSectors, fsmChecksumOk,
-                            fsmReadComplete, dirReadComplete);
+    reportMetadataIntegrity(map, badSectors);
     reportImageGeometry(adfsFsm);
 
-    const uint64_t sector0Position = m_image.sector0Position();
-    const uint64_t imageSize = m_image.imageSize();
-    const std::set<uint32_t> metadata = metadataEfmSectors();
-
     std::set<uint32_t> damagedEfmSectors;   // bad sectors that intersect file data
-    std::set<uint32_t> fileEfmSectors;      // every EFM sector covered by an object
     std::set<uint32_t> dumpedEfmSectors;    // so each bad sector is dumped only once
     std::vector<ObjectDamage> objectDamage;
     std::vector<ObjectContentReport> objectContent;
     AdfsContentCheck contentCheck(m_image, badSectors);
 
     // Verify the root directory entries one at a time
-    const std::vector<AdfsDirectoryEntry> entries = adfsDirectory.entries();
-    for (size_t i = 0; i < entries.size(); ++i) {
-        const AdfsDirectoryEntry &entry = entries.at(i);
-
-        const uint32_t startSector = entry.startSector();
-        const uint32_t byteLength = entry.byteLength();
-        const uint32_t sectorLength = entry.sectorLength();
+    const std::vector<VfsObject> &objects = map.objects();
+    for (size_t i = 0; i < objects.size(); ++i) {
+        const VfsObject &object = objects.at(i);
 
         LOG_DEBUG("Directory entry {} start sector {} length {} sectors - object name {}",
-            i, startSector, sectorLength, entry.objectName());
+            i, object.startSector, object.sectorLength, object.name);
 
         ObjectDamage damage;
-        damage.name = entry.objectName();
-        damage.startSector = startSector;
-        damage.sectorLength = sectorLength;
-        damage.byteLength = byteLength;
+        damage.name = object.name;
+        damage.startSector = object.startSector;
+        damage.sectorLength = object.sectorLength;
+        damage.byteLength = object.byteLength;
         damage.damagedEfmSectors = 0;
         damage.damagedBytes = 0;
-        damage.extendsPastEndOfImage = false;
+        damage.extendsPastEndOfImage = object.extendsPastEndOfImage;
 
-        const uint64_t objectStart = sector0Position + (static_cast<uint64_t>(startSector) * ADFS_SECTOR_SIZE);
-        const uint64_t objectEnd = objectStart + byteLength;
-        if (objectEnd > imageSize) damage.extendsPastEndOfImage = true;
-
-        if (sectorLength > 0) {
-            const uint32_t firstEfm = m_image.adfsSectorToEfmSector(startSector);
-            const uint32_t lastEfm = m_image.adfsSectorToEfmSector(startSector + sectorLength - 1);
-
-            for (uint32_t efmSector = firstEfm; efmSector <= lastEfm; ++efmSector) {
-                fileEfmSectors.insert(efmSector);
+        if (object.sectorLength > 0) {
+            for (uint32_t efmSector = object.firstEfmSector; efmSector <= object.lastEfmSector; ++efmSector) {
                 if (!badSectors.isSectorBad(efmSector)) continue;
 
                 ++damage.damagedEfmSectors;
                 damagedEfmSectors.insert(efmSector);
 
                 // How much of this object does the bad sector actually cover?
-                const uint64_t efmStart = static_cast<uint64_t>(efmSector) * EFM_SECTOR_SIZE;
-                const uint64_t efmEnd = efmStart + EFM_SECTOR_SIZE;
-                const uint64_t overlapStart = std::max(objectStart, efmStart);
-                const uint64_t overlapEnd = std::min(objectEnd, efmEnd);
-                if (overlapEnd > overlapStart) damage.damagedBytes += overlapEnd - overlapStart;
+                damage.damagedBytes += VfsMap::overlapBytes(object, efmSector);
 
                 // Report and dump each bad sector once
                 if (dumpedEfmSectors.insert(efmSector).second) {
                     // The first ADFS sector of this object that falls in the bad EFM sector
-                    uint32_t adfsSector = startSector;
-                    if (efmStart > objectStart) {
-                        adfsSector = startSector + static_cast<uint32_t>((efmStart - objectStart) / ADFS_SECTOR_SIZE);
+                    const uint64_t efmStart = static_cast<uint64_t>(efmSector) * EFM_SECTOR_SIZE;
+                    uint32_t adfsSector = object.startSector;
+                    if (efmStart > object.startOffset) {
+                        adfsSector = object.startSector +
+                            static_cast<uint32_t>((efmStart - object.startOffset) / ADFS_SECTOR_SIZE);
                     }
                     LOG_DEBUG("AdfsVerifier::process() - Bad EFM sector {} found in object {} ADFS sector {}",
-                        efmSector, entry.objectName(), toString24bits(adfsSector));
+                        efmSector, object.name, toString24bits(adfsSector));
 
                     // Display the data of the ADFS sector that falls within the bad EFM sector
                     std::vector<uint8_t> badSectorData = m_image.readSectors(adfsSector, 1, false);
@@ -455,8 +429,8 @@ bool AdfsVerifier::process(const std::string &filename, const std::string &bsmFi
 
         // Measure how much of the object actually carries data
         ObjectContentReport contentReport;
-        contentReport.name = entry.objectName();
-        contentReport.content = contentCheck.checkObject(startSector, sectorLength);
+        contentReport.name = object.name;
+        contentReport.content = contentCheck.checkObject(object.startSector, object.sectorLength);
         objectContent.push_back(contentReport);
     }
 
@@ -466,31 +440,16 @@ bool AdfsVerifier::process(const std::string &filename, const std::string &bsmFi
 
     // Classify every entry in the bad sector map
     MapAnalysis analysis = {0, 0, 0, 0, 0, 0};
-    const uint32_t discSectors = adfsFsm.numberOfSectors();
 
     for (uint32_t efmSector : badSectors.sectors()) {
-        const uint64_t efmStart = static_cast<uint64_t>(efmSector) * EFM_SECTOR_SIZE;
-        const uint64_t efmEnd = efmStart + EFM_SECTOR_SIZE;
-
-        if (efmEnd <= sector0Position) { ++analysis.beforeFilesystem; continue; }
-        if (efmStart >= imageSize) { ++analysis.pastEndOfImage; continue; }
-        if (fileEfmSectors.count(efmSector) > 0) { ++analysis.withinFileData; continue; }
-        if (metadata.count(efmSector) > 0) { ++analysis.filesystemMetadata; continue; }
-
-        // Which ADFS sectors does this EFM sector cover?
-        const uint32_t firstAdfs = (efmStart >= sector0Position)
-            ? static_cast<uint32_t>((efmStart - sector0Position) / ADFS_SECTOR_SIZE) : 0;
-        const uint32_t lastAdfs =
-            static_cast<uint32_t>((efmEnd - 1 - sector0Position) / ADFS_SECTOR_SIZE);
-
-        bool allocated = false;
-        for (uint32_t adfsSector = firstAdfs; adfsSector <= lastAdfs; ++adfsSector) {
-            if (adfsSector >= discSectors) break;
-            if (!adfsFsm.isFree(adfsSector)) { allocated = true; break; }
+        switch (map.classify(efmSector)) {
+        case SectorRole::BeforeFilesystem:  ++analysis.beforeFilesystem; break;
+        case SectorRole::FileData:          ++analysis.withinFileData; break;
+        case SectorRole::Metadata:          ++analysis.filesystemMetadata; break;
+        case SectorRole::AllocatedUnlisted: ++analysis.allocatedButUnlisted; break;
+        case SectorRole::FreeSpace:         ++analysis.freeSpace; break;
+        case SectorRole::PastEndOfImage:    ++analysis.pastEndOfImage; break;
         }
-
-        if (allocated) ++analysis.allocatedButUnlisted;
-        else ++analysis.freeSpace;
     }
 
     reportMapAnalysis(analysis, badSectors);

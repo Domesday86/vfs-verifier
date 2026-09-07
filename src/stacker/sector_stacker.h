@@ -1,0 +1,252 @@
+/************************************************************************
+
+    sector_stacker.h
+
+    vfs-stacker - Acorn VFS (Domesday) image stacker
+    Copyright (C) 2025-2026 Simon Inns
+
+    This application is free software: you can redistribute it and/or
+    modify it under the terms of the GNU General Public License as
+    published by the Free Software Foundation, either version 3 of the
+    License, or (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+************************************************************************/
+
+#ifndef SECTOR_STACKER_H
+#define SECTOR_STACKER_H
+
+#include "adfs_image.h"
+#include "bad_sectors.h"
+#include "sector_sizes.h"
+#include "vfs_map.h"
+
+#include <cstdint>
+#include <fstream>
+#include <memory>
+#include <string>
+#include <vector>
+
+// One decode taking part in the stack: the image itself and the bad sector map
+// the decoder wrote alongside it
+class StackSource
+{
+public:
+    bool open(const std::string &imageFilename);
+
+    // Read one EFM sector; returns false if the source does not extend that far
+    bool readSector(uint64_t sector, std::vector<uint8_t> &buffer);
+
+    bool isGood(uint64_t sector) const
+    {
+        return sector < m_sectorCount && !m_badSectors.isSectorBad(static_cast<uint32_t>(sector));
+    }
+
+    bool hasSector(uint64_t sector) const { return sector < m_sectorCount; }
+
+    const std::string &filename() const { return m_imageFilename; }
+    const std::string &bsmFilename() const { return m_bsmFilename; }
+    uint64_t sectorCount() const { return m_sectorCount; }
+    uint64_t imageSize() const { return m_imageSize; }
+    uint64_t trailingBytes() const { return m_imageSize % EFM_SECTOR_SIZE; }
+    const BadSectors &badSectors() const { return m_badSectors; }
+
+    // Number of output sectors this source was the only good candidate for
+    uint64_t uniqueContribution = 0;
+    // Of those, the ones the filesystem actually depends on
+    uint64_t uniqueVitalContribution = 0;
+    // Number of output sectors taken from this source
+    uint64_t sectorsUsed = 0;
+    // Sectors the filesystem depends on that this source alone could not supply
+    uint64_t vitalBad = 0;
+
+private:
+    std::string m_imageFilename;
+    std::string m_bsmFilename;
+    std::ifstream m_file;
+    BadSectors m_badSectors;
+    uint64_t m_imageSize = 0;
+    uint64_t m_sectorCount = 0;
+};
+
+// How each output sector was arrived at
+enum class SectorOrigin {
+    Unanimous,      // one or more sources vouch for it and they all agree
+    Majority,       // sources that vouch for it disagree; the majority won
+    Split,          // sources that vouch for it disagree with no majority
+    Consensus,      // no source vouches for it, but enough sources agree on real content
+    Unrecovered     // no source vouches for it and nothing could be salvaged
+};
+
+// The decision reached for one output sector
+struct SectorPlan
+{
+    static constexpr uint16_t NO_SOURCE = 0xFFFF;
+
+    SectorOrigin origin = SectorOrigin::Unrecovered;
+    uint16_t source = NO_SOURCE;    // which source supplies the content
+};
+
+struct StackResult
+{
+    uint64_t outputSectors = 0;
+    uint64_t unanimous = 0;
+    uint64_t majority = 0;
+    uint64_t split = 0;
+    uint64_t consensus = 0;
+    uint64_t unrecovered = 0;
+
+    // The remaining bad sectors, which are what is written to the output map
+    std::vector<uint32_t> outputBadSectors;
+};
+
+// The damage a still-bad sector does to one object of the root directory
+struct StackedObjectDamage
+{
+    std::string name;
+    uint32_t byteLength = 0;
+    uint32_t damagedEfmSectors = 0;
+    uint64_t damagedBytes = 0;
+};
+
+// What the filesystem makes of the sectors that are still bad
+struct FilesystemAnalysis
+{
+    static constexpr size_t ROLE_COUNT = 6;
+
+    bool loaded = false;
+    uint32_t byRole[ROLE_COUNT] = {0, 0, 0, 0, 0, 0};
+
+    // Sectors the filesystem depends on that are still bad
+    std::vector<uint32_t> vitalSectors;
+    std::vector<StackedObjectDamage> damagedObjects;
+
+    uint32_t vitalCount() const { return static_cast<uint32_t>(vitalSectors.size()); }
+};
+
+// Pairwise comparison of two sources over the sectors both call good. Decodes of
+// the same disc must agree; widespread disagreement means the images are not
+// aligned with each other and stacking them would splice unrelated data together
+struct AlignmentPair
+{
+    size_t sourceA = 0;
+    size_t sourceB = 0;
+    uint64_t compared = 0;
+    uint64_t disagreed = 0;
+
+    double disagreementPercent() const
+    {
+        return compared == 0 ? 0.0 : (100.0 * static_cast<double>(disagreed) / static_cast<double>(compared));
+    }
+};
+
+class SectorStacker
+{
+public:
+    // consensusThreshold: how many sources must agree byte-for-byte on a sector
+    // that every source flagged as bad before it is accepted anyway. Zero
+    // disables consensus recovery
+    SectorStacker(uint32_t consensusThreshold, bool force);
+
+    bool addSource(const std::string &imageFilename);
+
+    // Compare the sources against each other; must be run before plan()
+    bool checkAlignment();
+
+    // Decide where every output sector comes from, without writing anything
+    bool plan();
+
+    // Read the filesystem of the planned image and work out which of the
+    // sectors that are still bad actually matter
+    bool analyseFilesystem();
+
+    // Write the planned image and its bad sector map
+    bool write(const std::string &outputFilename);
+
+    // Read one sector of the planned image; used by the stacked image reader
+    bool readStackedSector(uint64_t sector, std::vector<uint8_t> &buffer);
+
+    uint64_t outputSectors() const { return m_outputSectors; }
+    uint64_t outputSize() const { return m_outputSectors * EFM_SECTOR_SIZE; }
+
+    void reportSources() const;
+    void reportAlignment() const;
+    void reportResult() const;
+    void reportFilesystem(const std::string &outputFilename) const;
+
+    size_t sourceCount() const { return m_sources.size(); }
+    const StackResult &result() const { return m_result; }
+    const FilesystemAnalysis &filesystemAnalysis() const { return m_analysis; }
+
+private:
+    // Every byte the same, and that byte one of the decoder's padding values.
+    // Such a sector carries no data, so agreement between sources on it says
+    // nothing about whether either of them recovered anything
+    static bool isFillSector(const std::vector<uint8_t> &buffer);
+
+    // Of the given candidates, the content held by the most of them, and how
+    // many held it. Ties are broken in favour of the earliest source given
+    static size_t mostCommonContent(const std::vector<size_t> &candidates,
+                                    const std::vector<std::vector<uint8_t>> &buffers,
+                                    uint32_t &agreementCount);
+
+    // Best fallback for a sector nothing vouches for: the first source holding
+    // something other than padding, or failing that the first source at all
+    static bool chooseFallback(const std::vector<size_t> &present,
+                               const std::vector<std::vector<uint8_t>> &buffers,
+                               size_t &chosen);
+
+    // Read one output sector from every source that holds it, filling good with
+    // the sources that vouch for it and present with all of them
+    void gatherSector(uint64_t sector, std::vector<std::vector<uint8_t>> &buffers,
+                      std::vector<size_t> &good, std::vector<size_t> &present);
+
+    // What each source would have contributed, measured against the filesystem
+    void measureSourcesAgainstMap();
+
+    bool writeBadSectorMap(const std::string &filename) const;
+
+    static void logSectorRuns(const std::vector<uint32_t> &sectors, const VfsMap *map,
+                              const std::string &prefix, size_t maxRunsAtInfo, bool asWarning = false);
+
+    std::vector<std::unique_ptr<StackSource>> m_sources;
+    std::vector<AlignmentPair> m_alignment;
+    std::vector<SectorPlan> m_plan;
+    StackResult m_result;
+    FilesystemAnalysis m_analysis;
+
+    AdfsImage m_stackedImage;
+    VfsMap m_map;
+
+    uint64_t m_outputSectors = 0;
+    uint32_t m_consensusThreshold;
+    bool m_force;
+    bool m_alignmentChecked = false;
+    bool m_alignmentSuspect = false;
+    bool m_planned = false;
+};
+
+// Presents the planned stack as a readable image, so that the filesystem can be
+// parsed out of a merge that has not been written to disc
+class StackedImageReader : public ImageReader
+{
+public:
+    StackedImageReader(SectorStacker &stacker) : m_stacker(stacker) {}
+
+    uint64_t size() const override { return m_stacker.outputSize(); }
+    size_t read(uint64_t offset, uint8_t *buffer, size_t length) override;
+    std::string description() const override { return "the stacked image"; }
+
+private:
+    SectorStacker &m_stacker;
+    std::vector<uint8_t> m_sector;
+};
+
+#endif // SECTOR_STACKER_H

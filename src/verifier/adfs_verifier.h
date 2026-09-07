@@ -32,6 +32,7 @@
 #include "adfs_fsm.h"
 #include "adfs_directory.h"
 #include "adfs_content.h"
+#include "vfs_map.h"
 #include "bad_sectors.h"
 
 class AdfsVerifier
@@ -75,12 +76,9 @@ private:
     AdfsImage m_image;
     bool m_verificationPassed;
 
-    std::set<uint32_t> metadataEfmSectors() const;
 
     void reportFilesystemLocation() const;
-    void reportMetadataIntegrity(const AdfsFsm &fsm, const AdfsDirectory &directory,
-                                 const BadSectors &badSectors, bool fsmChecksumOk,
-                                 bool fsmReadComplete, bool directoryReadComplete);
+    void reportMetadataIntegrity(const VfsMap &map, const BadSectors &badSectors);
     void reportImageGeometry(const AdfsFsm &fsm) const;
     void reportObjectDamage(const std::vector<ObjectDamage> &damage) const;
     void reportMapAnalysis(const MapAnalysis &analysis, const BadSectors &badSectors) const;

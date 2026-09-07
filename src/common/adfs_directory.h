@@ -2,7 +2,7 @@
 
     adfs_directory.h
 
-    vfs-verifier - Acorn VFS (Domesday) image verifier
+    vfs-tools - Acorn VFS (Domesday) image tools
     Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
@@ -83,7 +83,9 @@ private:
 class AdfsDirectory
 {
 public:
-    AdfsDirectory(const std::vector<uint8_t>& sectors);
+    // listEntries prints the object list as the directory is parsed; a tool that
+    // only needs the map for classification passes false
+    AdfsDirectory(const std::vector<uint8_t>& sectors, bool listEntries = true);
 
     std::vector<AdfsDirectoryEntry> entries() const;
 

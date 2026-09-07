@@ -2,7 +2,7 @@
 
     adfs_directory.cpp
 
-    vfs-verifier - Acorn VFS (Domesday) image verifier
+    vfs-tools - Acorn VFS (Domesday) image tools
     Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
@@ -132,7 +132,7 @@ void AdfsDirectoryEntry::show()
         toString32bits(m_byteLength), toString24bits(m_startSector));
 }
 
-AdfsDirectory::AdfsDirectory(const std::vector<uint8_t>& sectors) :
+AdfsDirectory::AdfsDirectory(const std::vector<uint8_t>& sectors, bool listEntries) :
     m_isValid(false),
     m_broken(true),
     m_entriesTerminated(false),
@@ -196,7 +196,7 @@ AdfsDirectory::AdfsDirectory(const std::vector<uint8_t>& sectors) :
 
     // Read the directory entries. The final directory entry is followed by a
     // &00 byte; in a full directory this &00 byte is the byte at &4CB.
-    LOG_INFO("Directory entries:");
+    if (listEntries) LOG_INFO("Directory entries:");
     for (int i = 0; i < 47; ++i) {
         std::vector<uint8_t> entryData(sectors.begin() + 5 + (i * 26), sectors.begin() + 5 + ((i + 1) * 26));
         AdfsDirectoryEntry entry(entryData);
@@ -207,7 +207,7 @@ AdfsDirectory::AdfsDirectory(const std::vector<uint8_t>& sectors) :
             break;
         }
 
-        entry.show();
+        if (listEntries) entry.show();
         m_adfsDirectoryEntries.push_back(entry);
     }
 

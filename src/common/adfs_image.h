@@ -2,7 +2,7 @@
 
     adfs_image.h
 
-    vfs-verifier - Acorn VFS (Domesday) image verifier
+    vfs-tools - Acorn VFS (Domesday) image tools
     Copyright (C) 2025-2026 Simon Inns
 
     This application is free software: you can redistribute it and/or
@@ -25,12 +25,11 @@
 
 #include <string>
 #include <vector>
-#include <fstream>
+#include <memory>
 #include <cstdint>
 
-// Sector sizes used throughout the verifier
-static const uint32_t ADFS_SECTOR_SIZE = 256;
-static const uint32_t EFM_SECTOR_SIZE = 2048;
+#include "sector_sizes.h"
+#include "image_reader.h"
 
 class AdfsImage
 {
@@ -38,6 +37,10 @@ public:
     AdfsImage();
 
     bool open(const std::string& filename);
+
+    // Take an already-constructed reader, for an image that is not a file
+    bool attach(std::unique_ptr<ImageReader> reader);
+
     void close();
     std::vector<uint8_t> readSectors(uint64_t sector, uint64_t count, bool verifyChecksum);
     uint32_t adfsSectorToEfmSector(uint32_t adfsSector) const;
@@ -57,7 +60,7 @@ public:
 
 private:
     bool m_isValid;
-    std::ifstream m_file;
+    std::unique_ptr<ImageReader> m_reader;
     uint64_t m_sector0Position;
     uint64_t m_imageSize;
     bool m_lastReadComplete;
