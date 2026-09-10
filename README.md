@@ -238,6 +238,7 @@ vfs-stacker -o <output> <input> <input> [<input>...]
 - `--consensus <n>` - Override the consensus rule, accepting a sector that *every* source flagged as bad when at least `n` sources hold byte-identical content for it (minimum 2, maximum the number of inputs). By default the requirement is a majority of the sources
 - `--no-consensus` - Never accept a sector that every source flagged as bad, however many sources agree on its content
 - `--no-pad` - Leave the output at the length the sources reached, instead of padding a short image out to the disc length the filesystem describes
+- `--show-conflicts` - Hex dump the sectors the sources hold different content for, so that decode damage can be told from the sources being different versions of the disc
 - `--dry-run` - Report what stacking would produce without writing anything
 - `--force` - Stack the sources even when the alignment cross-check says they do not agree
 - `--log-level <level>` - Console log level: `trace`, `debug`, `info` (default), `warn`, `error`, `critical`, `off`
@@ -376,6 +377,50 @@ The independence this rests on cannot be verified, only estimated. Two sources
 whose bad sector maps are *identical* are almost certainly the same decode rather
 than two attempts, and the cross-check names them: such a pair adds nothing to
 the stack and makes sectors look better agreed-upon than they are.
+
+### Damage, or a different version of the disc?
+
+Two quite different things make sources disagree, and they need opposite
+responses. A bad decode is worth stacking away. Two *versions* of the same title
+must not be stacked at all - merging them splices unrelated content together and
+the result is a disc that never existed. The stacker reports every sector the
+sources held different content for, and tries to say which of the two it is
+looking at.
+
+Three signals separate them:
+
+- **Did anyone vouch for it?** A decoder that flags a sector good is asserting it
+  read the disc correctly. Two sources vouching for the same sector and still
+  disagreeing means the discs differ. Where *nothing* vouched for a sector, both
+  sides are guesses and the difference is much more likely to be damage.
+- **Do the same sources always take the same side?** Decode damage is random -
+  which source dissents varies sector to sector. A different pressing is
+  systematic: the same sources dissent every time, because they really are a
+  different disc. The report groups the conflicts by exactly this split.
+- **Is one side padding?** Where one source holds `0x00`/`0x20`/`0xFF` and the
+  other holds data, they are not disagreeing about the disc - one of them simply
+  recovered more of it. The report counts these separately from real differences.
+
+`--show-conflicts` then hex dumps the sectors themselves, one row per distinct
+content, showing only the rows that differ with `^^` under the differing bytes:
+
+```
+  EFM sector 100000 at 0xC350000 - no majority; first source taken,
+                                   1736 byte(s) differ in 184 run(s)
+    A - 1 source(s), chosen: version_a.dat (good)
+    B - 1 source(s): version_b.dat (good)
+      0x0000  A  67 20 74 6f 20 67 6f 20 75 70 2e 20 54 68 65 20 |g to go up. The |
+      0x0000  B  69 63 68 20 74 68 65 20 20 20 20 20 20 20 20 20 |ich the         |
+                 ^^ ^^ ^^ ^^ ^^ ^^ ^^    ^^ ^^ ^^    ^^ ^^ ^^
+```
+
+Two sources that both vouched for a sector, holding readable text that simply
+says different things, is a version difference and no amount of stacking will
+help.
+
+Sources that fail the alignment cross-check are refused, but the same report is
+produced anyway - being told *why* they were refused is the whole point when the
+question is whether they are the same disc.
 
 ### Padding a short capture
 

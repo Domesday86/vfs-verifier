@@ -34,6 +34,24 @@ const double ALIGNMENT_DISAGREEMENT_LIMIT = 0.1;
 // How many runs of remaining bad sectors to name in the summary report
 const size_t MAX_RUNS_AT_INFO = 20;
 
+// Badly matched sources can disagree in bulk, so the lists of individual sectors
+// kept for the reports are samples. The counters beside them are the real totals
+const size_t MAX_RECORDED_SECTORS = 4096;
+
+// How many conflicting sectors to hex dump, and how many differing rows of each
+const size_t MAX_CONFLICTS_AT_INFO = 20;
+const size_t MAX_DIFF_ROWS_AT_INFO = 8;
+
+// Bitmasks hold one bit per source, so the split analysis stops above this
+const size_t MAX_SOURCES_FOR_PATTERNS = 64;
+
+// A split that recurs over at least this share of the conflicts is systematic
+// rather than incidental
+const double PATTERN_DOMINANT_SHARE = 0.6;
+
+// Below this many conflicts there is not enough to draw a conclusion from
+const uint64_t PATTERN_MINIMUM_SECTORS = 4;
+
 std::string megabytes(uint64_t bytes)
 {
     return fmt::format("{:.1f} MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
@@ -48,6 +66,12 @@ std::string percent(uint64_t part, uint64_t whole)
 size_t roleIndex(SectorRole role)
 {
     return static_cast<size_t>(role);
+}
+
+// The values the decoder leaves behind where it recovered nothing
+bool isFillByte(uint8_t value)
+{
+    return value == 0x00 || value == 0x20 || value == 0xFF;
 }
 
 } // namespace
@@ -138,11 +162,8 @@ size_t StackedImageReader::read(uint64_t offset, uint8_t *buffer, size_t length)
 
 // SectorStacker -------------------------------------------------------------
 
-SectorStacker::SectorStacker(ConsensusMode mode, uint32_t consensusThreshold, bool pad, bool force) :
-    m_consensusMode(mode),
-    m_consensusThreshold(consensusThreshold),
-    m_pad(pad),
-    m_force(force)
+SectorStacker::SectorStacker(const StackerOptions &options) :
+    m_options(options)
 {}
 
 bool SectorStacker::addSource(const std::string &imageFilename)
@@ -238,14 +259,128 @@ bool SectorStacker::chooseFallback(const std::vector<size_t> &present,
     return true;
 }
 
+void SectorStacker::recordConflict(uint64_t sector, SectorOrigin origin, size_t chosen,
+                                   const std::vector<size_t> &candidates,
+                                   const std::vector<std::vector<uint8_t>> &buffers,
+                                   uint32_t agreement, uint32_t runnerUp)
+{
+    ++m_result.conflictCount;
+    if (m_result.conflicts.size() >= MAX_RECORDED_SECTORS) return;
+    if (m_sources.size() > MAX_SOURCES_FOR_PATTERNS) return;
+
+    ConflictSector conflict;
+    conflict.sector = static_cast<uint32_t>(sector);
+    conflict.origin = origin;
+    conflict.agreement = agreement;
+    conflict.runnerUp = runnerUp;
+    conflict.contested = (runnerUp >= 2);
+
+    // Who sided with the content that was chosen, and who held the largest
+    // alternative to it. Everything else is a lone dissenter and says nothing
+    // about how the sources line up
+    const std::vector<uint8_t> *runnerUpContent = nullptr;
+    uint32_t runnerUpSeen = 0;
+
+    for (size_t index : candidates) {
+        if (buffers[index] == buffers[chosen]) continue;
+
+        uint32_t count = 0;
+        for (size_t other : candidates) {
+            if (buffers[index] == buffers[other]) ++count;
+        }
+        if (count > runnerUpSeen) {
+            runnerUpSeen = count;
+            runnerUpContent = &buffers[index];
+        }
+    }
+
+    for (size_t index : candidates) {
+        const uint64_t bit = uint64_t(1) << index;
+        if (buffers[index] == buffers[chosen]) {
+            conflict.winners |= bit;
+        } else if (runnerUpContent != nullptr && buffers[index] == *runnerUpContent) {
+            conflict.losers |= bit;
+        }
+    }
+
+    // How far apart the two sides are. Damage touches a few bytes; different
+    // content differs all the way through
+    if (runnerUpContent != nullptr) {
+        const std::vector<uint8_t> &a = buffers[chosen];
+        const std::vector<uint8_t> &b = *runnerUpContent;
+        const size_t length = std::min(a.size(), b.size());
+        bool inRun = false;
+
+        for (size_t i = 0; i < length; ++i) {
+            if (a[i] != b[i]) {
+                ++conflict.differingBytes;
+                // One side padding and the other data means one decode simply
+                // got further here; both sides holding data means they disagree
+                if (isFillByte(a[i]) != isFillByte(b[i])) ++conflict.fillOnlyBytes;
+                if (!inRun) {
+                    ++conflict.differingRuns;
+                    inRun = true;
+                }
+            } else {
+                inRun = false;
+            }
+        }
+    }
+
+    m_result.conflicts.push_back(conflict);
+}
+
+// The same sources dissenting over and over is not something decode damage does
+void SectorStacker::summariseConflictPatterns()
+{
+    m_result.conflictPatterns.clear();
+
+    for (const ConflictSector &conflict : m_result.conflicts) {
+        auto it = std::find_if(m_result.conflictPatterns.begin(), m_result.conflictPatterns.end(),
+            [&conflict](const ConflictPattern &pattern) {
+                return pattern.winners == conflict.winners && pattern.losers == conflict.losers;
+            });
+
+        if (it == m_result.conflictPatterns.end()) {
+            ConflictPattern pattern;
+            pattern.winners = conflict.winners;
+            pattern.losers = conflict.losers;
+            pattern.sectors = 1;
+            pattern.totalDifferingBytes = conflict.differingBytes;
+            pattern.totalFillOnlyBytes = conflict.fillOnlyBytes;
+            m_result.conflictPatterns.push_back(pattern);
+        } else {
+            ++it->sectors;
+            it->totalDifferingBytes += conflict.differingBytes;
+            it->totalFillOnlyBytes += conflict.fillOnlyBytes;
+        }
+    }
+
+    std::sort(m_result.conflictPatterns.begin(), m_result.conflictPatterns.end(),
+        [](const ConflictPattern &a, const ConflictPattern &b) { return a.sectors > b.sectors; });
+}
+
+std::string SectorStacker::sourceList(uint64_t mask) const
+{
+    std::string list;
+
+    for (size_t index = 0; index < m_sources.size(); ++index) {
+        if ((mask & (uint64_t(1) << index)) == 0) continue;
+        if (!list.empty()) list += ", ";
+        list += m_sources[index]->filename();
+    }
+
+    return list.empty() ? "(none)" : list;
+}
+
 uint32_t SectorStacker::consensusRequirement(size_t present) const
 {
-    switch (m_consensusMode) {
+    switch (m_options.consensusMode) {
     case ConsensusMode::Off:
         return 0;
 
     case ConsensusMode::Fixed:
-        return m_consensusThreshold;
+        return m_options.consensusThreshold;
 
     case ConsensusMode::Auto:
         // A majority of the sources that hold the sector, and never fewer than
@@ -311,7 +446,18 @@ bool SectorStacker::checkAlignment()
             }
 
             ++pair.compared;
-            if (buffers[pair.sourceA] != buffers[pair.sourceB]) ++pair.disagreed;
+            if (buffers[pair.sourceA] != buffers[pair.sourceB]) {
+                ++pair.disagreed;
+
+                // Keep a sample so that a refused stack can still be explained.
+                // Sectors arrive in order and several pairs can fall out over
+                // the same one, so only the first mention of each is kept
+                if (m_alignmentDisagreements.size() < MAX_RECORDED_SECTORS &&
+                    (m_alignmentDisagreements.empty() ||
+                     m_alignmentDisagreements.back() != static_cast<uint32_t>(sector))) {
+                    m_alignmentDisagreements.push_back(static_cast<uint32_t>(sector));
+                }
+            }
         }
     }
 
@@ -335,12 +481,13 @@ bool SectorStacker::plan()
         return false;
     }
 
-    if (m_alignmentSuspect && !m_force) {
+    if (m_alignmentSuspect && !m_options.force) {
         LOG_ERROR("Refusing to stack sources that do not agree with each other - see the alignment "
                   "cross-check above");
         LOG_ERROR("These images are either decodes of different discs, or one of them has gained or "
                   "lost sectors during decoding, which displaces everything after it");
-        LOG_ERROR("Use --force to stack them anyway");
+        LOG_ERROR("The disagreement report below says which of the two it looks like; add "
+                  "--show-conflicts to see the bytes themselves. Use --force to stack them anyway");
         return false;
     }
 
@@ -362,7 +509,8 @@ bool SectorStacker::plan()
 
         if (!good.empty()) {
             uint32_t agreement = 0;
-            const size_t chosen = mostCommonContent(good, buffers, agreement);
+            uint32_t runnerUp = 0;
+            const size_t chosen = mostCommonContent(good, buffers, agreement, &runnerUp);
             decision.source = static_cast<uint16_t>(chosen);
             decision.agreement = static_cast<uint16_t>(agreement);
 
@@ -381,6 +529,13 @@ bool SectorStacker::plan()
                 LOG_DEBUG("EFM sector {} - the {} source(s) that recovered it all disagree; taking the "
                           "content from {}",
                     sector, good.size(), m_sources[chosen]->filename());
+            }
+
+            // Sources that vouched for a sector and still disagree are the
+            // strongest evidence of all that they are not the same disc: each
+            // decoder is telling us it read this cleanly
+            if (agreement < good.size()) {
+                recordConflict(sector, decision.origin, chosen, good, buffers, agreement, runnerUp);
             }
 
             ++m_sources[chosen]->sectorsUsed;
@@ -409,13 +564,21 @@ bool SectorStacker::plan()
                 // sector is both, and resting on two sources is the fact worth
                 // knowing about it
                 if (agreement == 2) {
-                    m_result.consensusThin.push_back(static_cast<uint32_t>(sector));
+                    ++m_result.consensusThinCount;
+                    if (m_result.consensusThin.size() < MAX_RECORDED_SECTORS) {
+                        m_result.consensusThin.push_back(static_cast<uint32_t>(sector));
+                    }
                 }
 
                 // Two or more sources holding a different answer is not noise;
                 // it is the sources disagreeing about what the disc says
                 if (runnerUp >= 2) {
-                    m_result.consensusContested.push_back(static_cast<uint32_t>(sector));
+                    ++m_result.consensusContestedCount;
+                    if (m_result.consensusContested.size() < MAX_RECORDED_SECTORS) {
+                        m_result.consensusContested.push_back(static_cast<uint32_t>(sector));
+                    }
+                    recordConflict(sector, SectorOrigin::Consensus, candidate, present, buffers,
+                        agreement, runnerUp);
                 }
 
                 LOG_DEBUG("EFM sector {} - flagged bad by every source, but {} of {} agree on real "
@@ -440,6 +603,8 @@ bool SectorStacker::plan()
 
         m_plan[static_cast<size_t>(sector)] = decision;
     }
+
+    summariseConflictPatterns();
 
     m_planned = true;
     return true;
@@ -538,7 +703,7 @@ bool SectorStacker::analyseFilesystem()
 // missing rather than quietly ignored
 void SectorStacker::padToDeclaredLength()
 {
-    if (!m_pad) return;
+    if (!m_options.pad) return;
 
     const uint32_t discSectors = m_map.fsm().numberOfSectors();
     if (discSectors == 0) return;
@@ -827,9 +992,9 @@ void SectorStacker::reportResult() const
         LOG_WARN("  Recovered but split          : {} - no majority; the first source was taken",
             m_result.split);
     }
-    if (m_consensusMode != ConsensusMode::Off) {
-        const std::string rule = (m_consensusMode == ConsensusMode::Fixed)
-            ? fmt::format("{}+ sources agree", m_consensusThreshold)
+    if (m_options.consensusMode != ConsensusMode::Off) {
+        const std::string rule = (m_options.consensusMode == ConsensusMode::Fixed)
+            ? fmt::format("{}+ sources agree", m_options.consensusThreshold)
             : "a majority of sources agree";
         LOG_INFO("  Recovered by consensus       : {} - flagged bad everywhere, but {}",
             m_result.consensus, rule);
@@ -839,19 +1004,19 @@ void SectorStacker::reportResult() const
 
             // Two sources agreeing is the least the tool will act on, so say so
             // rather than letting it pass as though it were unanimous
-            if (!m_result.consensusThin.empty()) {
+            if (m_result.consensusThinCount > 0) {
                 LOG_WARN("    Accepted on two sources    : {} - the weakest evidence the stack acts on; "
                          "use --no-consensus to reject them",
-                    m_result.consensusThin.size());
+                    m_result.consensusThinCount);
                 logSectorRuns(m_result.consensusThin, m_analysis.loaded ? &m_map : nullptr,
                     "      ", MAX_RUNS_AT_INFO, true);
             }
 
             // Sources splitting into camps is a different problem from noise
-            if (!m_result.consensusContested.empty()) {
+            if (m_result.consensusContestedCount > 0) {
                 LOG_WARN("    Contested                  : {} - two or more sources held a different "
-                         "answer, so check these are all decodes of the same disc",
-                    m_result.consensusContested.size());
+                         "answer; see the source disagreement report below",
+                    m_result.consensusContestedCount);
                 logSectorRuns(m_result.consensusContested, m_analysis.loaded ? &m_map : nullptr,
                     "      ", MAX_RUNS_AT_INFO, true);
             }
@@ -923,6 +1088,312 @@ void SectorStacker::reportResult() const
         LOG_INFO("  Stacking recovered {} EFM sector(s) ({}) that the best single source lacked",
             bestSingle - m_result.totalBad(),
             megabytes((bestSingle - m_result.totalBad()) * EFM_SECTOR_SIZE));
+    }
+}
+
+// One 16-byte row of a sector, in the usual hex-and-ASCII form
+static std::string hexRow(const std::vector<uint8_t> &buffer, size_t offset)
+{
+    std::string hex;
+    std::string ascii;
+
+    for (size_t i = 0; i < 16; ++i) {
+        if (offset + i < buffer.size()) {
+            const uint8_t value = buffer[offset + i];
+            hex += fmt::format("{:02x} ", value);
+            ascii += (value >= 0x20 && value < 0x7F) ? static_cast<char>(value) : '.';
+        } else {
+            hex += "   ";
+            ascii += ' ';
+        }
+    }
+
+    return fmt::format("{}|{}|", hex, ascii);
+}
+
+// Show one sector as the sources hold it: one block per distinct content, and
+// only the rows where they differ
+void SectorStacker::dumpConflict(const ConflictSector &conflict, bool asWarning)
+{
+    std::vector<std::vector<uint8_t>> buffers(m_sources.size());
+    std::vector<size_t> good;
+    std::vector<size_t> present;
+    gatherSector(conflict.sector, buffers, good, present);
+
+    if (present.empty()) {
+        LOG_WARN("  EFM sector {} could not be re-read from any source", conflict.sector);
+        return;
+    }
+
+    // Group the sources by the content they hold, commonest first, with the
+    // content that was chosen leading
+    std::vector<std::vector<size_t>> variants;
+    for (size_t index : present) {
+        auto it = std::find_if(variants.begin(), variants.end(),
+            [&](const std::vector<size_t> &variant) { return buffers[variant.front()] == buffers[index]; });
+
+        if (it == variants.end()) {
+            variants.push_back({index});
+        } else {
+            it->push_back(index);
+        }
+    }
+
+    std::sort(variants.begin(), variants.end(),
+        [&](const std::vector<size_t> &a, const std::vector<size_t> &b) {
+            const bool aChosen = (conflict.winners & (uint64_t(1) << a.front())) != 0;
+            const bool bChosen = (conflict.winners & (uint64_t(1) << b.front())) != 0;
+            if (aChosen != bChosen) return aChosen;
+            return a.size() > b.size();
+        });
+
+    const char *originName = "";
+    switch (conflict.origin) {
+    case SectorOrigin::Majority:  originName = "majority won"; break;
+    case SectorOrigin::Split:     originName = "no majority; first source taken"; break;
+    case SectorOrigin::Consensus: originName = "consensus recovery, contested"; break;
+    default:                      originName = "disagreement"; break;
+    }
+
+    std::string where;
+    if (m_analysis.loaded) {
+        const VfsObject *object = m_map.objectForEfmSector(conflict.sector);
+        where = (object != nullptr)
+            ? fmt::format(" in {}", object->name)
+            : fmt::format(" - {}", sectorRoleName(m_map.classify(conflict.sector)));
+    }
+
+    const std::string header = fmt::format("  EFM sector {}{} at 0x{:X} - {}, {} byte(s) differ in "
+                                           "{} run(s) ({} padding against data)",
+        conflict.sector, where, static_cast<uint64_t>(conflict.sector) * EFM_SECTOR_SIZE, originName,
+        conflict.differingBytes, conflict.differingRuns, conflict.fillOnlyBytes);
+
+    if (asWarning) LOG_WARN("{}", header); else LOG_INFO("{}", header);
+
+    // Which sources hold which content, and whether each vouched for it
+    char letter = 'A';
+    for (const std::vector<size_t> &variant : variants) {
+        std::string names;
+        for (size_t index : variant) {
+            if (!names.empty()) names += ", ";
+            names += fmt::format("{} ({})", m_sources[index]->filename(),
+                m_sources[index]->isGood(conflict.sector) ? "good" : "bad");
+        }
+
+        const bool chosen = (conflict.winners & (uint64_t(1) << variant.front())) != 0;
+        LOG_INFO("    {} - {} source(s){}: {}", letter, variant.size(), chosen ? ", chosen" : "", names);
+        ++letter;
+    }
+
+    // Only the rows that actually differ are worth printing: a 2048-byte sector
+    // in full would bury the handful of bytes in question
+    size_t rowsShown = 0;
+    for (size_t offset = 0; offset < EFM_SECTOR_SIZE; offset += 16) {
+        std::string markers;
+        bool rowDiffers = false;
+
+        for (size_t i = 0; i < 16; ++i) {
+            bool byteDiffers = false;
+            for (const std::vector<size_t> &variant : variants) {
+                const std::vector<uint8_t> &first = buffers[variants.front().front()];
+                const std::vector<uint8_t> &other = buffers[variant.front()];
+                if (offset + i < first.size() && offset + i < other.size() &&
+                    first[offset + i] != other[offset + i]) {
+                    byteDiffers = true;
+                    break;
+                }
+            }
+
+            markers += byteDiffers ? "^^ " : "   ";
+            if (byteDiffers) rowDiffers = true;
+        }
+
+        if (!rowDiffers) continue;
+
+        // Past the cap the rest still goes to the log file, just not the console
+        const bool atInfo = (rowsShown < MAX_DIFF_ROWS_AT_INFO);
+        const std::string offsetField = fmt::format("0x{:04X}", offset);
+        const std::string blankField(offsetField.size(), ' ');
+
+        letter = 'A';
+        for (const std::vector<size_t> &variant : variants) {
+            const std::string line = fmt::format("      {}  {}  {}",
+                offsetField, letter, hexRow(buffers[variant.front()], offset));
+            if (atInfo) LOG_INFO("{}", line); else LOG_DEBUG("{}", line);
+            ++letter;
+        }
+
+        const std::string markerLine = fmt::format("      {}     {}", blankField, markers);
+        if (atInfo) LOG_INFO("{}", markerLine); else LOG_DEBUG("{}", markerLine);
+
+        ++rowsShown;
+    }
+
+    if (rowsShown > MAX_DIFF_ROWS_AT_INFO) {
+        LOG_INFO("      ...and {} further differing row(s), listed at debug level",
+            rowsShown - MAX_DIFF_ROWS_AT_INFO);
+    }
+}
+
+void SectorStacker::reportAlignmentDisagreements()
+{
+    if (m_alignmentDisagreements.empty()) return;
+
+    LOG_INFO("Examining what the sources fell out about...");
+
+    // Nothing has been planned, so build the conflict records from the sample
+    // the cross-check kept
+    m_result.conflicts.clear();
+    m_result.conflictCount = 0;
+
+    std::vector<std::vector<uint8_t>> buffers(m_sources.size());
+    std::vector<size_t> good;
+    std::vector<size_t> present;
+
+    for (uint32_t sector : m_alignmentDisagreements) {
+        gatherSector(sector, buffers, good, present);
+        if (good.size() < 2) continue;
+
+        uint32_t agreement = 0;
+        uint32_t runnerUp = 0;
+        const size_t chosen = mostCommonContent(good, buffers, agreement, &runnerUp);
+        if (agreement == good.size()) continue;
+
+        const SectorOrigin origin = (agreement * 2 > good.size())
+            ? SectorOrigin::Majority : SectorOrigin::Split;
+        recordConflict(sector, origin, chosen, good, buffers, agreement, runnerUp);
+    }
+
+    summariseConflictPatterns();
+    reportConflicts();
+}
+
+void SectorStacker::reportConflicts()
+{
+    if (m_result.conflictCount == 0) {
+        if (m_options.showConflicts) {
+            LOG_INFO("Source disagreement: none - wherever two sources both held a sector, they held "
+                     "the same bytes");
+        }
+        return;
+    }
+
+    LOG_WARN("Source disagreement ({} sector(s) where the sources held different content):",
+        m_result.conflictCount);
+
+    // The question this answers is whether the sources are the same disc. Decode
+    // damage is random, so the dissenting sources change from sector to sector.
+    // A different pressing is not random: the same sources dissent every time
+    if (!m_result.conflictPatterns.empty()) {
+        LOG_INFO("  How the sources split:");
+
+        size_t shown = 0;
+        for (const ConflictPattern &pattern : m_result.conflictPatterns) {
+            if (shown >= 4) {
+                LOG_INFO("    ...and {} further split(s)", m_result.conflictPatterns.size() - shown);
+                break;
+            }
+
+            LOG_INFO("    {} sector(s): {}", pattern.sectors, sourceList(pattern.winners));
+            LOG_INFO("      differing from            : {}", sourceList(pattern.losers));
+            LOG_INFO("      average {} byte(s) of {} differ per sector, {} of them padding on one "
+                     "side and data on the other",
+                pattern.totalDifferingBytes / std::max<uint64_t>(1, pattern.sectors), EFM_SECTOR_SIZE,
+                pattern.totalFillOnlyBytes / std::max<uint64_t>(1, pattern.sectors));
+            ++shown;
+        }
+
+        const ConflictPattern &top = m_result.conflictPatterns.front();
+        const double share = static_cast<double>(top.sectors) /
+                             static_cast<double>(m_result.conflicts.size());
+        const bool consistentSplit =
+            m_result.conflicts.size() >= PATTERN_MINIMUM_SECTORS &&
+            share >= PATTERN_DOMINANT_SHARE && top.losers != 0;
+
+        // Whether a source vouched for the sector decides which question is
+        // even being asked. A decoder that flagged a sector good is asserting it
+        // read the disc correctly, so two of them differing means the discs
+        // differ. Where nothing vouched for it, both sides are guesses and the
+        // difference is far more likely to be how much each one recovered
+        uint64_t vouched = 0;
+        uint64_t unvouchedDiffering = 0;
+        uint64_t unvouchedFillOnly = 0;
+
+        for (const ConflictSector &conflict : m_result.conflicts) {
+            if (conflict.origin != SectorOrigin::Consensus) {
+                ++vouched;
+            } else {
+                unvouchedDiffering += conflict.differingBytes;
+                unvouchedFillOnly += conflict.fillOnlyBytes;
+            }
+        }
+
+        LOG_INFO("  Interpreting this:");
+
+        if (vouched > 0) {
+            LOG_WARN("    {} of these are sectors the sources vouched for and still disagree on. A "
+                     "decoder that flags a sector good believes it read the disc correctly, so two "
+                     "of them differing means the discs themselves differ",
+                vouched);
+
+            if (consistentSplit) {
+                LOG_WARN("    The same sources take opposite sides in {} of {} cases. Decode damage "
+                         "does not repeat like that - these are different versions of the disc",
+                    top.sectors, m_result.conflicts.size());
+                LOG_WARN("    Stack each version separately rather than merging them, or the output "
+                         "will be a splice of both");
+            } else {
+                LOG_WARN("    Which sources dissent varies from sector to sector, so this looks more "
+                         "like one decoder wrongly vouching for damaged sectors than a difference "
+                         "between versions - but it is worth looking at the bytes");
+            }
+        } else {
+            // Nothing vouched for any of them, so the fill test is the useful
+            // one: padding against data is a recovery difference, and data
+            // against data in an area no decoder trusted is simply noise
+            const bool mostlyRecovery =
+                unvouchedDiffering > 0 &&
+                static_cast<double>(unvouchedFillOnly) /
+                    static_cast<double>(unvouchedDiffering) >= 0.5;
+
+            LOG_INFO("    Every one of these is a sector no source vouched for, and the sources agree "
+                     "byte-for-byte everywhere they all decoded cleanly. Whatever they are, they are "
+                     "not a disagreement about readable content");
+
+            if (mostlyRecovery) {
+                LOG_INFO("    Most of the differing bytes are padding on one side and data on the "
+                         "other, which is one decode having got further than the other rather than "
+                         "the two holding different content");
+            } else if (consistentSplit) {
+                LOG_INFO("    The same sources take opposite sides each time, which in an area no "
+                         "decoder trusted usually means those sources share a capture problem there "
+                         "rather than being a different version");
+            } else {
+                LOG_INFO("    Which sources dissent varies from sector to sector, which is what "
+                         "decode damage looks like");
+            }
+        }
+    }
+
+    if (!m_options.showConflicts) {
+        LOG_INFO("  Use --show-conflicts to hex dump what the sources disagree about");
+        return;
+    }
+
+    if (m_result.conflictCount > m_result.conflicts.size()) {
+        LOG_INFO("  Dumping the first {} of {}", m_result.conflicts.size(), m_result.conflictCount);
+    }
+
+    size_t dumped = 0;
+    for (const ConflictSector &conflict : m_result.conflicts) {
+        if (dumped >= MAX_CONFLICTS_AT_INFO) {
+            LOG_INFO("  ...and {} further sector(s), not dumped",
+                m_result.conflicts.size() - dumped);
+            break;
+        }
+
+        dumpConflict(conflict, conflict.origin != SectorOrigin::Consensus);
+        ++dumped;
     }
 }
 
@@ -1042,7 +1513,7 @@ void SectorStacker::reportFilesystem(const std::string &outputFilename) const
         }
 
         if (within > 0) {
-            if (m_consensusMode == ConsensusMode::Off) {
+            if (m_options.consensusMode == ConsensusMode::Off) {
                 LOG_WARN("  {} of them have {}+ sources holding identical content; consensus recovery "
                          "is switched off, and dropping --no-consensus would accept them",
                     within, lowest);

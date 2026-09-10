@@ -107,6 +107,49 @@ enum class ConsensusMode {
     Fixed       // accept when a given number of sources hold identical content
 };
 
+// One sector the sources did not all hold the same content for, kept so that the
+// conflict report can show what they disagree about.
+//
+// Two quite different things produce these. Decode noise is random: which
+// sources dissent varies from sector to sector, and the damage is a byte or two.
+// A genuine difference between pressings is systematic: the same sources dissent
+// every time, because they really are a different disc. Recording who was on
+// each side is what lets the two be told apart
+struct ConflictSector
+{
+    uint32_t sector = 0;
+    SectorOrigin origin = SectorOrigin::Unrecovered;
+    uint32_t agreement = 0;     // sources holding the content that was chosen
+    uint32_t runnerUp = 0;      // largest group holding anything else
+    bool contested = false;     // two or more sources held that other answer
+
+    // Which sources held the chosen content, and which held the runner-up.
+    // Bit n is source n; only populated when there are at most 64 sources
+    uint64_t winners = 0;
+    uint64_t losers = 0;
+
+    // How far apart the two are. A handful of bytes is damage; a sector that
+    // differs throughout is different content
+    uint32_t differingBytes = 0;
+    uint32_t differingRuns = 0;
+
+    // Of those, the bytes where one side holds a padding value and the other
+    // holds data. That is not the two sides disagreeing about what the disc
+    // says: it is one of them having recovered less of it
+    uint32_t fillOnlyBytes = 0;
+};
+
+// How the sources split, aggregated over every conflict. The same split
+// recurring is the signature of a version difference rather than decode damage
+struct ConflictPattern
+{
+    uint64_t winners = 0;
+    uint64_t losers = 0;
+    uint64_t sectors = 0;
+    uint64_t totalDifferingBytes = 0;
+    uint64_t totalFillOnlyBytes = 0;
+};
+
 struct StackResult
 {
     uint64_t outputSectors = 0;
@@ -123,10 +166,21 @@ struct StackResult
     uint64_t consensusUnanimous = 0;
     // Consensus recoveries resting on two sources alone - the weakest evidence
     // the tool will act on
+    uint64_t consensusThinCount = 0;
     std::vector<uint32_t> consensusThin;
     // Consensus recoveries made while two or more other sources held a
     // different answer, which suggests the sources are not all the same disc
+    uint64_t consensusContestedCount = 0;
     std::vector<uint32_t> consensusContested;
+
+    // Every sector the sources held differing content for. A badly matched pair
+    // of sources can produce these in bulk, so the list is a capped sample and
+    // conflictCount is the real total
+    std::vector<ConflictSector> conflicts;
+    uint64_t conflictCount = 0;
+
+    // How the sources split over those conflicts, commonest split first
+    std::vector<ConflictPattern> conflictPatterns;
 
     // The remaining bad sectors, which are what is written to the output map.
     // Both the sectors no source could supply and any padding added to the end
@@ -180,15 +234,29 @@ struct AlignmentPair
     }
 };
 
+struct StackerOptions
+{
+    // Whether sectors every source flagged as bad may be recovered from the
+    // sources agreeing with each other. Under ConsensusMode::Fixed,
+    // consensusThreshold is how many sources must agree byte-for-byte; under
+    // Auto the requirement is worked out per sector and the threshold is unused
+    ConsensusMode consensusMode = ConsensusMode::Auto;
+    uint32_t consensusThreshold = 0;
+
+    // Extend a short image to the length the filesystem says the disc is
+    bool pad = true;
+
+    // Stack sources that failed the alignment cross-check
+    bool force = false;
+
+    // Hex dump what the sources disagree about, sector by sector
+    bool showConflicts = false;
+};
+
 class SectorStacker
 {
 public:
-    // mode decides whether sectors every source flagged as bad may be recovered
-    // from the sources agreeing with each other. Under ConsensusMode::Fixed,
-    // consensusThreshold is how many sources must agree byte-for-byte; under
-    // Auto the requirement is worked out per sector and the threshold is ignored.
-    // pad extends a short image to the length the filesystem says the disc is
-    SectorStacker(ConsensusMode mode, uint32_t consensusThreshold, bool pad, bool force);
+    explicit SectorStacker(const StackerOptions &options);
 
     bool addSource(const std::string &imageFilename);
 
@@ -215,6 +283,19 @@ public:
     void reportAlignment() const;
     void reportResult() const;
     void reportFilesystem(const std::string &outputFilename) const;
+
+    // What the sources disagree about, and whether that reads as decode damage
+    // or as the sources being different versions of the disc. Re-reads the
+    // sectors from the sources, so it is not const
+    void reportConflicts();
+
+    // The same report, built from the sectors the alignment cross-check found
+    // the sources disagreeing over. Sources that fail the cross-check are never
+    // planned, so this is the only way to see what they fell out about - which
+    // is exactly what is needed to tell a bad decode from a different version
+    void reportAlignmentDisagreements();
+
+    bool alignmentSuspect() const { return m_alignmentSuspect; }
 
     size_t sourceCount() const { return m_sources.size(); }
     const StackResult &result() const { return m_result; }
@@ -250,6 +331,22 @@ private:
     // are classified, since the padding is part of what is still bad
     void padToDeclaredLength();
 
+    // Record one sector the sources disagreed about, and how they split over it
+    void recordConflict(uint64_t sector, SectorOrigin origin, size_t chosen,
+                        const std::vector<size_t> &candidates,
+                        const std::vector<std::vector<uint8_t>> &buffers,
+                        uint32_t agreement, uint32_t runnerUp);
+
+    // Collect the splits seen across every recorded conflict, commonest first
+    void summariseConflictPatterns();
+
+    // Names of the sources in a bitmask, for the report
+    std::string sourceList(uint64_t mask) const;
+
+    // Hex dump one sector, one row per distinct content, showing only the rows
+    // that differ
+    void dumpConflict(const ConflictSector &conflict, bool asWarning);
+
     // Read one output sector from every source that holds it, filling good with
     // the sources that vouch for it and present with all of them
     void gatherSector(uint64_t sector, std::vector<std::vector<uint8_t>> &buffers,
@@ -265,6 +362,8 @@ private:
 
     std::vector<std::unique_ptr<StackSource>> m_sources;
     std::vector<AlignmentPair> m_alignment;
+    // A capped sample of the sectors two vouching sources disagreed over
+    std::vector<uint32_t> m_alignmentDisagreements;
     std::vector<SectorPlan> m_plan;
     StackResult m_result;
     FilesystemAnalysis m_analysis;
@@ -276,10 +375,7 @@ private:
     // How long the image was before any padding was added, so that the report
     // can say what the captures actually reached
     uint64_t m_capturedSectors = 0;
-    ConsensusMode m_consensusMode;
-    uint32_t m_consensusThreshold;
-    bool m_pad;
-    bool m_force;
+    StackerOptions m_options;
     bool m_alignmentChecked = false;
     bool m_alignmentSuspect = false;
     // Some pair of sources failed on exactly the same sectors

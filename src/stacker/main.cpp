@@ -48,6 +48,9 @@ int main(int argc, char *argv[])
     parser.addOption("", "no-pad", "Leave the output at the length the sources reached, instead of "
                                    "padding a short image out to the disc length the filesystem "
                                    "describes");
+    parser.addOption("", "show-conflicts", "Hex dump the sectors the sources hold different content "
+                                           "for, to tell decode damage from the sources being "
+                                           "different versions of the disc");
     parser.addOption("", "dry-run", "Report what stacking would produce without writing anything");
     parser.addOption("", "force", "Stack the sources even if they do not agree with each other");
     parser.addOption("", "log-level", "Set console log level: trace, debug, info, warn, error, critical, off", true);
@@ -146,11 +149,17 @@ int main(int argc, char *argv[])
 
     LOG_INFO("Beginning VFS image stacking of {} source image(s)", inputFilenames.size());
 
+    StackerOptions options;
+    options.consensusMode = consensusMode;
+    options.consensusThreshold = consensusThreshold;
     // A capture that stopped short leaves the image shorter than the disc, which
     // displaces nothing but does leave the file the wrong length. The filesystem
     // says how long the disc is, so the tail is restored as empty sectors
-    SectorStacker stacker(consensusMode, consensusThreshold, !parser.isSet("no-pad"),
-        parser.isSet("force"));
+    options.pad = !parser.isSet("no-pad");
+    options.force = parser.isSet("force");
+    options.showConflicts = parser.isSet("show-conflicts");
+
+    SectorStacker stacker(options);
 
     for (const std::string &inputFilename : inputFilenames) {
         if (!stacker.addSource(inputFilename)) {
@@ -168,6 +177,12 @@ int main(int argc, char *argv[])
     // Decide where every sector comes from before anything is written, so that a
     // dry run and a real run reach exactly the same conclusions
     if (!stacker.plan()) {
+        // Refusing to stack is not the end of the operator's question: whether
+        // the sources are a bad decode or genuinely different versions of the
+        // disc is answered by what they disagree about, so show that anyway
+        if (stacker.alignmentSuspect()) {
+            stacker.reportAlignmentDisagreements();
+        }
         return 1;
     }
 
@@ -182,6 +197,7 @@ int main(int argc, char *argv[])
     }
 
     stacker.reportResult();
+    stacker.reportConflicts();
     stacker.reportFilesystem(outputFilename);
 
     if (outputFilename.empty()) {
