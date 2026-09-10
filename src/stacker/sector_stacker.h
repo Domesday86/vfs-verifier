@@ -92,6 +92,19 @@ struct SectorPlan
 
     SectorOrigin origin = SectorOrigin::Unrecovered;
     uint16_t source = NO_SOURCE;    // which source supplies the content
+
+    // How many sources held the content that was chosen. Recorded for every
+    // sector, including the ones nothing could be made of, so that the report
+    // can say how close a sector that is still bad came to being recovered
+    uint16_t agreement = 0;
+};
+
+// Whether a sector that every source flagged as bad may still be accepted on the
+// strength of the sources agreeing with each other
+enum class ConsensusMode {
+    Off,        // never accept a sector no source vouches for
+    Auto,       // accept when a majority of the sources hold identical content
+    Fixed       // accept when a given number of sources hold identical content
 };
 
 struct StackResult
@@ -102,9 +115,24 @@ struct StackResult
     uint64_t split = 0;
     uint64_t consensus = 0;
     uint64_t unrecovered = 0;
+    // Empty sectors added to the end to bring the image up to the length the
+    // filesystem says the disc is. No source held these at all
+    uint64_t padded = 0;
 
-    // The remaining bad sectors, which are what is written to the output map
+    // Consensus recoveries every source agreed on, which are beyond argument
+    uint64_t consensusUnanimous = 0;
+    // Consensus recoveries resting on two sources alone - the weakest evidence
+    // the tool will act on
+    std::vector<uint32_t> consensusThin;
+    // Consensus recoveries made while two or more other sources held a
+    // different answer, which suggests the sources are not all the same disc
+    std::vector<uint32_t> consensusContested;
+
+    // The remaining bad sectors, which are what is written to the output map.
+    // Both the sectors no source could supply and any padding added to the end
     std::vector<uint32_t> outputBadSectors;
+
+    uint64_t totalBad() const { return outputBadSectors.size(); }
 };
 
 // The damage a still-bad sector does to one object of the root directory
@@ -141,6 +169,11 @@ struct AlignmentPair
     uint64_t compared = 0;
     uint64_t disagreed = 0;
 
+    // Two decodes that failed on exactly the same sectors are unlikely to be
+    // independent attempts. Consensus recovery leans on the sources failing
+    // independently, so this is worth saying out loud
+    bool identicalBadSectors = false;
+
     double disagreementPercent() const
     {
         return compared == 0 ? 0.0 : (100.0 * static_cast<double>(disagreed) / static_cast<double>(compared));
@@ -150,10 +183,12 @@ struct AlignmentPair
 class SectorStacker
 {
 public:
-    // consensusThreshold: how many sources must agree byte-for-byte on a sector
-    // that every source flagged as bad before it is accepted anyway. Zero
-    // disables consensus recovery
-    SectorStacker(uint32_t consensusThreshold, bool force);
+    // mode decides whether sectors every source flagged as bad may be recovered
+    // from the sources agreeing with each other. Under ConsensusMode::Fixed,
+    // consensusThreshold is how many sources must agree byte-for-byte; under
+    // Auto the requirement is worked out per sector and the threshold is ignored.
+    // pad extends a short image to the length the filesystem says the disc is
+    SectorStacker(ConsensusMode mode, uint32_t consensusThreshold, bool pad, bool force);
 
     bool addSource(const std::string &imageFilename);
 
@@ -192,16 +227,28 @@ private:
     static bool isFillSector(const std::vector<uint8_t> &buffer);
 
     // Of the given candidates, the content held by the most of them, and how
-    // many held it. Ties are broken in favour of the earliest source given
+    // many held it. Ties are broken in favour of the earliest source given.
+    // runnerUpCount, when asked for, receives the size of the largest group
+    // holding anything other than the winning content
     static size_t mostCommonContent(const std::vector<size_t> &candidates,
                                     const std::vector<std::vector<uint8_t>> &buffers,
-                                    uint32_t &agreementCount);
+                                    uint32_t &agreementCount,
+                                    uint32_t *runnerUpCount = nullptr);
 
-    // Best fallback for a sector nothing vouches for: the first source holding
-    // something other than padding, or failing that the first source at all
+    // Best fallback for a sector nothing vouches for: the content held by the
+    // most sources, ignoring the ones holding nothing but padding
     static bool chooseFallback(const std::vector<size_t> &present,
                                const std::vector<std::vector<uint8_t>> &buffers,
-                               size_t &chosen);
+                               size_t &chosen, uint32_t &agreementCount);
+
+    // How many sources must hold identical content before a sector no source
+    // vouches for is accepted, given how many sources hold it at all
+    uint32_t consensusRequirement(size_t present) const;
+
+    // Extend a short image to the length the filesystem says the disc is. Must
+    // be run after the map is loaded and before the sectors that are still bad
+    // are classified, since the padding is part of what is still bad
+    void padToDeclaredLength();
 
     // Read one output sector from every source that holds it, filling good with
     // the sources that vouch for it and present with all of them
@@ -226,10 +273,17 @@ private:
     VfsMap m_map;
 
     uint64_t m_outputSectors = 0;
+    // How long the image was before any padding was added, so that the report
+    // can say what the captures actually reached
+    uint64_t m_capturedSectors = 0;
+    ConsensusMode m_consensusMode;
     uint32_t m_consensusThreshold;
+    bool m_pad;
     bool m_force;
     bool m_alignmentChecked = false;
     bool m_alignmentSuspect = false;
+    // Some pair of sources failed on exactly the same sectors
+    bool m_duplicateSuspect = false;
     bool m_planned = false;
 };
 

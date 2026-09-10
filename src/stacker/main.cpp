@@ -40,8 +40,14 @@ int main(int argc, char *argv[])
 
     parser.addOption("o", "output", "Output VFS image file (the bad sector map is written to the same "
                                     "path with .bsm appended)", true);
-    parser.addOption("", "consensus", "Accept a sector every source flagged as bad when this many "
-                                      "sources hold identical data for it (0 disables, minimum 2)", true);
+    parser.addOption("", "consensus", "Override the consensus rule: accept a sector every source "
+                                      "flagged as bad when this many sources hold identical data for "
+                                      "it (minimum 2). The default is a majority of the sources", true);
+    parser.addOption("", "no-consensus", "Never accept a sector that every source flagged as bad, "
+                                         "however many sources agree on its content");
+    parser.addOption("", "no-pad", "Leave the output at the length the sources reached, instead of "
+                                   "padding a short image out to the disc length the filesystem "
+                                   "describes");
     parser.addOption("", "dry-run", "Report what stacking would produce without writing anything");
     parser.addOption("", "force", "Stack the sources even if they do not agree with each other");
     parser.addOption("", "log-level", "Set console log level: trace, debug, info, warn, error, critical, off", true);
@@ -104,16 +110,33 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Sectors every source flagged as bad are recovered from agreement between
+    // the sources by default: independent decoders do not arrive at the same
+    // 2048 bytes by accident, so leaving those sectors bad throws away recovery
+    // the sources already paid for. The report says what each recovery rested on
+    ConsensusMode consensusMode = ConsensusMode::Auto;
     uint32_t consensusThreshold = 0;
+
     const std::string consensusValue = parser.value("consensus");
-    if (!consensusValue.empty()) {
+    const bool noConsensus = parser.isSet("no-consensus");
+
+    if (noConsensus && !consensusValue.empty()) {
+        LOG_ERROR("--consensus and --no-consensus contradict each other; give only one of them");
+        return 1;
+    }
+
+    if (noConsensus) {
+        consensusMode = ConsensusMode::Off;
+    } else if (!consensusValue.empty()) {
         try {
             const unsigned long value = std::stoul(consensusValue);
-            if (value == 1 || value > inputFilenames.size()) {
-                LOG_ERROR("Invalid --consensus value {}: it must be 0, or between 2 and the number of "
-                          "input images ({})", consensusValue, inputFilenames.size());
+            if (value < 2 || value > inputFilenames.size()) {
+                LOG_ERROR("Invalid --consensus value {}: it must be between 2 and the number of input "
+                          "images ({}); use --no-consensus to switch consensus recovery off",
+                    consensusValue, inputFilenames.size());
                 return 1;
             }
+            consensusMode = ConsensusMode::Fixed;
             consensusThreshold = static_cast<uint32_t>(value);
         } catch (const std::exception &) {
             LOG_ERROR("Invalid --consensus value: {}", consensusValue);
@@ -123,7 +146,11 @@ int main(int argc, char *argv[])
 
     LOG_INFO("Beginning VFS image stacking of {} source image(s)", inputFilenames.size());
 
-    SectorStacker stacker(consensusThreshold, parser.isSet("force"));
+    // A capture that stopped short leaves the image shorter than the disc, which
+    // displaces nothing but does leave the file the wrong length. The filesystem
+    // says how long the disc is, so the tail is restored as empty sectors
+    SectorStacker stacker(consensusMode, consensusThreshold, !parser.isSet("no-pad"),
+        parser.isSet("force"));
 
     for (const std::string &inputFilename : inputFilenames) {
         if (!stacker.addSource(inputFilename)) {

@@ -138,8 +138,10 @@ size_t StackedImageReader::read(uint64_t offset, uint8_t *buffer, size_t length)
 
 // SectorStacker -------------------------------------------------------------
 
-SectorStacker::SectorStacker(uint32_t consensusThreshold, bool force) :
+SectorStacker::SectorStacker(ConsensusMode mode, uint32_t consensusThreshold, bool pad, bool force) :
+    m_consensusMode(mode),
     m_consensusThreshold(consensusThreshold),
+    m_pad(pad),
     m_force(force)
 {}
 
@@ -174,7 +176,8 @@ bool SectorStacker::isFillSector(const std::vector<uint8_t> &buffer)
 
 size_t SectorStacker::mostCommonContent(const std::vector<size_t> &candidates,
                                         const std::vector<std::vector<uint8_t>> &buffers,
-                                        uint32_t &agreementCount)
+                                        uint32_t &agreementCount,
+                                        uint32_t *runnerUpCount)
 {
     size_t best = candidates.front();
     agreementCount = 0;
@@ -191,24 +194,66 @@ size_t SectorStacker::mostCommonContent(const std::vector<size_t> &candidates,
         }
     }
 
+    // The largest group holding anything but the winning content. A large runner
+    // up means the sources are split into camps rather than merely noisy
+    if (runnerUpCount != nullptr) {
+        *runnerUpCount = 0;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (buffers[candidates[i]] == buffers[best]) continue;
+
+            uint32_t count = 0;
+            for (size_t j = 0; j < candidates.size(); ++j) {
+                if (buffers[candidates[i]] == buffers[candidates[j]]) ++count;
+            }
+            if (count > *runnerUpCount) *runnerUpCount = count;
+        }
+    }
+
     return best;
 }
 
 bool SectorStacker::chooseFallback(const std::vector<size_t> &present,
                                    const std::vector<std::vector<uint8_t>> &buffers,
-                                   size_t &chosen)
+                                   size_t &chosen, uint32_t &agreementCount)
 {
     if (present.empty()) return false;
 
+    // Nothing here is trustworthy, but the sources still vote: content several
+    // of them arrived at independently beats content only one of them holds,
+    // even when none of them will vouch for it. Sources holding nothing but
+    // padding are left out of the vote, since padding is what a decoder writes
+    // when it recovered nothing at all
+    std::vector<size_t> candidates;
     for (size_t index : present) {
-        if (!isFillSector(buffers[index])) {
-            chosen = index;
-            return true;
-        }
+        if (!isFillSector(buffers[index])) candidates.push_back(index);
     }
 
-    chosen = present.front();
+    if (candidates.empty()) {
+        chosen = present.front();
+        agreementCount = 0;
+        return true;
+    }
+
+    chosen = mostCommonContent(candidates, buffers, agreementCount);
     return true;
+}
+
+uint32_t SectorStacker::consensusRequirement(size_t present) const
+{
+    switch (m_consensusMode) {
+    case ConsensusMode::Off:
+        return 0;
+
+    case ConsensusMode::Fixed:
+        return m_consensusThreshold;
+
+    case ConsensusMode::Auto:
+        // A majority of the sources that hold the sector, and never fewer than
+        // two: one source agreeing with itself is not evidence of anything
+        return std::max<uint32_t>(2, static_cast<uint32_t>(present / 2 + 1));
+    }
+
+    return 0;
 }
 
 void SectorStacker::gatherSector(uint64_t sector, std::vector<std::vector<uint8_t>> &buffers,
@@ -240,6 +285,8 @@ bool SectorStacker::checkAlignment()
             AlignmentPair pair;
             pair.sourceA = a;
             pair.sourceB = b;
+            pair.identicalBadSectors =
+                m_sources[a]->badSectors().sectors() == m_sources[b]->badSectors().sectors();
             m_alignment.push_back(pair);
         }
     }
@@ -269,10 +316,12 @@ bool SectorStacker::checkAlignment()
     }
 
     m_alignmentSuspect = false;
+    m_duplicateSuspect = false;
     for (const AlignmentPair &pair : m_alignment) {
         if (pair.compared > 0 && pair.disagreementPercent() > ALIGNMENT_DISAGREEMENT_LIMIT) {
             m_alignmentSuspect = true;
         }
+        if (pair.identicalBadSectors) m_duplicateSuspect = true;
     }
 
     m_alignmentChecked = true;
@@ -299,6 +348,7 @@ bool SectorStacker::plan()
 
     m_result = StackResult();
     m_result.outputSectors = m_outputSectors;
+    m_capturedSectors = m_outputSectors;
     m_plan.assign(static_cast<size_t>(m_outputSectors), SectorPlan());
 
     std::vector<std::vector<uint8_t>> buffers(m_sources.size());
@@ -314,6 +364,7 @@ bool SectorStacker::plan()
             uint32_t agreement = 0;
             const size_t chosen = mostCommonContent(good, buffers, agreement);
             decision.source = static_cast<uint16_t>(chosen);
+            decision.agreement = static_cast<uint16_t>(agreement);
 
             if (agreement == good.size()) {
                 decision.origin = SectorOrigin::Unanimous;
@@ -334,19 +385,39 @@ bool SectorStacker::plan()
 
             ++m_sources[chosen]->sectorsUsed;
             if (good.size() == 1) ++m_sources[good.front()]->uniqueContribution;
-        } else if (m_consensusThreshold > 0 && present.size() >= m_consensusThreshold) {
+        } else if (!present.empty()) {
             // Nothing vouches for this sector, but independent decoders do not
             // make the same mistake twice: if enough of them produced identical
             // content, and that content is not just padding, it is almost
             // certainly right
-            uint32_t agreement = 0;
-            const size_t candidate = mostCommonContent(present, buffers, agreement);
+            const uint32_t required = consensusRequirement(present.size());
 
-            if (agreement >= m_consensusThreshold && !isFillSector(buffers[candidate])) {
+            uint32_t agreement = 0;
+            uint32_t runnerUp = 0;
+            const size_t candidate = mostCommonContent(present, buffers, agreement, &runnerUp);
+
+            if (required > 0 && agreement >= required && !isFillSector(buffers[candidate])) {
                 decision.origin = SectorOrigin::Consensus;
                 decision.source = static_cast<uint16_t>(candidate);
+                decision.agreement = static_cast<uint16_t>(agreement);
                 ++m_result.consensus;
                 ++m_sources[candidate]->sectorsUsed;
+
+                if (agreement == present.size()) ++m_result.consensusUnanimous;
+
+                // Not an alternative to being unanimous: with two sources a
+                // sector is both, and resting on two sources is the fact worth
+                // knowing about it
+                if (agreement == 2) {
+                    m_result.consensusThin.push_back(static_cast<uint32_t>(sector));
+                }
+
+                // Two or more sources holding a different answer is not noise;
+                // it is the sources disagreeing about what the disc says
+                if (runnerUp >= 2) {
+                    m_result.consensusContested.push_back(static_cast<uint32_t>(sector));
+                }
+
                 LOG_DEBUG("EFM sector {} - flagged bad by every source, but {} of {} agree on real "
                           "content; accepting it",
                     sector, agreement, present.size());
@@ -358,10 +429,12 @@ bool SectorStacker::plan()
             m_result.outputBadSectors.push_back(static_cast<uint32_t>(sector));
 
             // Nothing here is trustworthy, but the output is the same length
-            // whatever happens, so keep whichever copy holds the most data
+            // whatever happens, so keep the copy the most sources arrived at
             size_t fallback = 0;
-            if (chooseFallback(present, buffers, fallback)) {
+            uint32_t agreement = 0;
+            if (chooseFallback(present, buffers, fallback, agreement)) {
                 decision.source = static_cast<uint16_t>(fallback);
+                decision.agreement = static_cast<uint16_t>(agreement);
             }
         }
 
@@ -416,6 +489,11 @@ bool SectorStacker::analyseFilesystem()
 
     m_analysis.loaded = true;
 
+    // The filesystem knows how long the disc is, which is not always how much of
+    // it the captures reached. Do this before classifying, since anything added
+    // here is part of what the output still lacks
+    padToDeclaredLength();
+
     // Which of the sectors that are still bad does the filesystem depend on?
     std::vector<StackedObjectDamage> damage;
     std::map<std::string, size_t> damageIndex;
@@ -450,6 +528,86 @@ bool SectorStacker::analyseFilesystem()
     measureSourcesAgainstMap();
 
     return true;
+}
+
+// A capture that stopped short leaves an image shorter than the disc it came
+// from, which is not damage the bad sector map can express: the sectors are not
+// bad, they are absent. The free space map says how long the disc is, so the
+// tail can be restored as empty sectors. Everything then sits at the offset the
+// filesystem expects, and whatever depended on the missing tail is reported as
+// missing rather than quietly ignored
+void SectorStacker::padToDeclaredLength()
+{
+    if (!m_pad) return;
+
+    const uint32_t discSectors = m_map.fsm().numberOfSectors();
+    if (discSectors == 0) return;
+
+    // A partial EFM sector at the end still has to be written whole
+    const uint64_t declaredSize = m_map.declaredImageSize();
+    const uint64_t declaredSectors = (declaredSize + EFM_SECTOR_SIZE - 1) / EFM_SECTOR_SIZE;
+
+    if (declaredSectors <= m_outputSectors) {
+        if (declaredSectors < m_outputSectors) {
+            // Not padded and not truncated: the extra may be run-out the
+            // filesystem does not describe, and throwing it away would be worse
+            // than carrying it
+            LOG_INFO("The sources run {} EFM sector(s) past the end of the disc the filesystem "
+                     "describes; the extra is kept as it is",
+                m_outputSectors - declaredSectors);
+        }
+        return;
+    }
+
+    // The length comes entirely from the free space map, so it is worth only as
+    // much as the free space map is. Padding to a length read out of damaged
+    // metadata would invent an image rather than complete one
+    if (!m_map.locatedByValidation() || !m_map.fsmChecksumOk()) {
+        LOG_WARN("The image is short of the {} EFM sector(s) the filesystem describes, but the free "
+                 "space map did not validate, so its disc length cannot be trusted; leaving the "
+                 "output at {} EFM sector(s)",
+            declaredSectors, m_outputSectors);
+        return;
+    }
+
+    if (!m_map.fsmTotalsConsistent()) {
+        LOG_WARN("The image is short of the {} EFM sector(s) the filesystem describes, but the free "
+                 "space map's own totals ({} used + {} free) do not add up to the {} sector(s) it "
+                 "claims the disc holds; leaving the output at {} EFM sector(s)",
+            declaredSectors, m_map.fsm().usedSectors(), m_map.fsm().freeSectors(), discSectors,
+            m_outputSectors);
+        return;
+    }
+
+    const uint64_t added = declaredSectors - m_outputSectors;
+
+    // Nothing supplies these, so they take the default plan: no source, which
+    // readStackedSector() already writes out as an empty sector
+    m_plan.resize(static_cast<size_t>(declaredSectors));
+    for (uint64_t sector = m_outputSectors; sector < declaredSectors; ++sector) {
+        m_result.outputBadSectors.push_back(static_cast<uint32_t>(sector));
+    }
+
+    m_outputSectors = declaredSectors;
+    m_result.outputSectors = m_outputSectors;
+    m_result.padded = added;
+
+    // classify() answers "past the end of the image" from the length it was
+    // given at load, so it has to be told the image grew
+    m_map.extendImageSize(m_outputSectors * EFM_SECTOR_SIZE);
+
+    LOG_INFO("The captures reach {} EFM sector(s) but the filesystem describes a disc of {} ({}); "
+             "padding the output with {} empty sector(s) ({})",
+        m_capturedSectors, declaredSectors, megabytes(declaredSize), added,
+        megabytes(added * EFM_SECTOR_SIZE));
+
+    // A tail longer than what was captured is not a decode that stopped just
+    // short, and zero-filling that much is worth a second look
+    if (added > m_capturedSectors) {
+        LOG_WARN("The padding is larger than the captured image itself - check that these sources are "
+                 "complete decodes and that the disc length above is right (--no-pad leaves the "
+                 "output at its captured length)");
+    }
 }
 
 // For each source, how much of what the filesystem depends on it could not
@@ -631,15 +789,33 @@ void SectorStacker::reportAlignment() const
     } else {
         LOG_INFO("  All source pairs agree - the images are aligned with each other");
     }
+
+    // Stacking assumes the sources failed independently. A pair that failed in
+    // exactly the same places probably did not
+    if (m_duplicateSuspect) {
+        for (const AlignmentPair &pair : m_alignment) {
+            if (!pair.identicalBadSectors) continue;
+            LOG_WARN("  {} and {} have identical bad sector maps - they look like the same decode "
+                     "rather than two independent attempts",
+                m_sources[pair.sourceA]->filename(), m_sources[pair.sourceB]->filename());
+        }
+        LOG_WARN("  Sources that are not independent add nothing to the stack, and they make sectors "
+                 "look better agreed-upon than they are");
+    }
 }
 
 void SectorStacker::reportResult() const
 {
-    const uint64_t covered = m_result.outputSectors - m_result.unrecovered;
+    const uint64_t covered = m_result.outputSectors - m_result.totalBad();
 
     LOG_INFO("Stacking result:");
     LOG_INFO("  Output holds {} EFM sector(s) ({})",
         m_result.outputSectors, megabytes(m_result.outputSectors * EFM_SECTOR_SIZE));
+
+    if (m_result.padded > 0) {
+        LOG_INFO("  Of which captured            : {} ({}); the rest is padding to the disc length",
+            m_capturedSectors, megabytes(m_capturedSectors * EFM_SECTOR_SIZE));
+    }
     LOG_INFO("  Recovered by agreement       : {} ({})",
         m_result.unanimous, percent(m_result.unanimous, m_result.outputSectors));
 
@@ -651,13 +827,49 @@ void SectorStacker::reportResult() const
         LOG_WARN("  Recovered but split          : {} - no majority; the first source was taken",
             m_result.split);
     }
-    if (m_consensusThreshold > 0) {
-        LOG_INFO("  Recovered by consensus       : {} - flagged bad everywhere, but {}+ sources agree",
-            m_result.consensus, m_consensusThreshold);
+    if (m_consensusMode != ConsensusMode::Off) {
+        const std::string rule = (m_consensusMode == ConsensusMode::Fixed)
+            ? fmt::format("{}+ sources agree", m_consensusThreshold)
+            : "a majority of sources agree";
+        LOG_INFO("  Recovered by consensus       : {} - flagged bad everywhere, but {}",
+            m_result.consensus, rule);
+
+        if (m_result.consensus > 0) {
+            LOG_INFO("    Every source agreed        : {}", m_result.consensusUnanimous);
+
+            // Two sources agreeing is the least the tool will act on, so say so
+            // rather than letting it pass as though it were unanimous
+            if (!m_result.consensusThin.empty()) {
+                LOG_WARN("    Accepted on two sources    : {} - the weakest evidence the stack acts on; "
+                         "use --no-consensus to reject them",
+                    m_result.consensusThin.size());
+                logSectorRuns(m_result.consensusThin, m_analysis.loaded ? &m_map : nullptr,
+                    "      ", MAX_RUNS_AT_INFO, true);
+            }
+
+            // Sources splitting into camps is a different problem from noise
+            if (!m_result.consensusContested.empty()) {
+                LOG_WARN("    Contested                  : {} - two or more sources held a different "
+                         "answer, so check these are all decodes of the same disc",
+                    m_result.consensusContested.size());
+                logSectorRuns(m_result.consensusContested, m_analysis.loaded ? &m_map : nullptr,
+                    "      ", MAX_RUNS_AT_INFO, true);
+            }
+        }
+    } else if (m_result.unrecovered > 0) {
+        LOG_INFO("  Consensus recovery is off; sectors every source flagged as bad were left bad even "
+                 "where the sources agree on their content");
     }
 
     LOG_INFO("  Still bad in every source    : {} ({})",
         m_result.unrecovered, percent(m_result.unrecovered, m_result.outputSectors));
+
+    if (m_result.padded > 0) {
+        LOG_WARN("  Padding at the end           : {} ({}) - no source reached this far, so these are "
+                 "empty and listed as bad",
+            m_result.padded, percent(m_result.padded, m_result.outputSectors));
+    }
+
     LOG_INFO("  Good sectors in the output   : {} of {} ({})",
         covered, m_result.outputSectors, percent(covered, m_result.outputSectors));
 
@@ -702,13 +914,15 @@ void SectorStacker::reportResult() const
         }
     }
 
+    // Both figures are measured over the padded length, so a source that stopped
+    // short is charged for the tail it never reached, as the output is
     LOG_INFO("Improvement:");
     LOG_INFO("  Best single source  : {} with {} bad EFM sector(s)", bestSingleName, bestSingle);
-    LOG_INFO("  Stacked output      : {} bad EFM sector(s)", m_result.unrecovered);
-    if (bestSingle > m_result.unrecovered) {
+    LOG_INFO("  Stacked output      : {} bad EFM sector(s)", m_result.totalBad());
+    if (bestSingle > m_result.totalBad()) {
         LOG_INFO("  Stacking recovered {} EFM sector(s) ({}) that the best single source lacked",
-            bestSingle - m_result.unrecovered,
-            megabytes((bestSingle - m_result.unrecovered) * EFM_SECTOR_SIZE));
+            bestSingle - m_result.totalBad(),
+            megabytes((bestSingle - m_result.totalBad()) * EFM_SECTOR_SIZE));
     }
 }
 
@@ -720,9 +934,9 @@ void SectorStacker::reportFilesystem(const std::string &outputFilename) const
         LOG_ERROR("Filesystem check:");
         LOG_ERROR("  No ADFS filesystem could be read from the stacked image, so there is no way to "
                   "tell whether the sectors that are still bad matter");
-        if (m_result.unrecovered > 0) {
+        if (m_result.totalBad() > 0) {
             LOG_INFO("Remaining bad sectors ({} distinct sector(s), bad in every source):",
-                m_result.unrecovered);
+                m_result.totalBad());
             logSectorRuns(m_result.outputBadSectors, nullptr, "    ", MAX_RUNS_AT_INFO);
         }
         LOG_ERROR("SectorStacker - RESULT: UNKNOWN - the filesystem of {} could not be read", target);
@@ -755,8 +969,13 @@ void SectorStacker::reportFilesystem(const std::string &outputFilename) const
     }
 
     // What the filesystem makes of the sectors that are still bad
-    LOG_INFO("Remaining bad sectors by role ({} sector(s) still bad in every source):",
-        m_result.unrecovered);
+    if (m_result.padded > 0) {
+        LOG_INFO("Remaining bad sectors by role ({} sector(s): {} bad in every source, {} padding):",
+            m_result.totalBad(), m_result.unrecovered, m_result.padded);
+    } else {
+        LOG_INFO("Remaining bad sectors by role ({} sector(s) still bad in every source):",
+            m_result.unrecovered);
+    }
     LOG_INFO("  Within file data             : {}", m_analysis.byRole[roleIndex(SectorRole::FileData)]);
     LOG_INFO("  Filesystem metadata          : {}", m_analysis.byRole[roleIndex(SectorRole::Metadata)]);
     LOG_INFO("  Allocated, not in any object : {}",
@@ -787,9 +1006,9 @@ void SectorStacker::reportFilesystem(const std::string &outputFilename) const
     }
 
     // The harmless remainder, for completeness
-    if (m_result.unrecovered > m_analysis.vitalCount()) {
+    if (m_result.totalBad() > m_analysis.vitalCount()) {
         LOG_INFO("Remaining bad sectors that cost nothing ({} sector(s)):",
-            m_result.unrecovered - m_analysis.vitalCount());
+            m_result.totalBad() - m_analysis.vitalCount());
         std::vector<uint32_t> harmless;
         for (uint32_t efmSector : m_result.outputBadSectors) {
             if (!isVitalRole(m_map.classify(efmSector))) harmless.push_back(efmSector);
@@ -801,7 +1020,7 @@ void SectorStacker::reportFilesystem(const std::string &outputFilename) const
     if (m_analysis.vitalCount() == 0) {
         LOG_INFO("SectorStacker - RESULT: GOOD - every sector the filesystem depends on was recovered; "
                  "{} still holds {} bad sector(s) but none of them affect file data or metadata",
-            target, m_result.unrecovered);
+            target, m_result.totalBad());
     } else {
         LOG_ERROR("SectorStacker - RESULT: INCOMPLETE - {} sector(s) that {} still lacks are needed by "
                   "the filesystem ({} in file data, {} in metadata, {} allocated but unlisted); more "
@@ -810,5 +1029,29 @@ void SectorStacker::reportFilesystem(const std::string &outputFilename) const
             m_analysis.byRole[roleIndex(SectorRole::FileData)],
             m_analysis.byRole[roleIndex(SectorRole::Metadata)],
             m_analysis.byRole[roleIndex(SectorRole::AllocatedUnlisted)]);
+
+        // Some of what is missing may be within reach of a looser rule. Say so
+        // rather than leaving the reader to guess that there is a knob at all
+        uint32_t within = 0;
+        uint32_t lowest = UINT32_MAX;
+        for (uint32_t efmSector : m_analysis.vitalSectors) {
+            const uint16_t agreement = m_plan[efmSector].agreement;
+            if (agreement < 2) continue;
+            ++within;
+            lowest = std::min(lowest, static_cast<uint32_t>(agreement));
+        }
+
+        if (within > 0) {
+            if (m_consensusMode == ConsensusMode::Off) {
+                LOG_WARN("  {} of them have {}+ sources holding identical content; consensus recovery "
+                         "is switched off, and dropping --no-consensus would accept them",
+                    within, lowest);
+            } else {
+                LOG_WARN("  {} of them have {}+ sources holding identical content, which is below the "
+                         "threshold in force; --consensus {} would accept them, on weaker evidence "
+                         "than the default rule asks for",
+                    within, lowest, lowest);
+            }
+        }
     }
 }

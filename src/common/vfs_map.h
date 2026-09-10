@@ -102,6 +102,21 @@ public:
     uint64_t sector0Position() const { return m_sector0Position; }
     uint64_t imageSize() const { return m_imageSize; }
 
+    // Tell the map the image it was read from has since been extended, so that
+    // classify() stops calling the added region "past the end of the image".
+    // The geometry is untouched: only the length of the image changes
+    void extendImageSize(uint64_t imageSize);
+
+    // The length the free space map says the disc is, which is not always how
+    // much of it was captured
+    uint64_t declaredImageSize() const
+    {
+        return m_sector0Position + (static_cast<uint64_t>(m_discSectors) * ADFS_SECTOR_SIZE);
+    }
+
+    // True if the free space map's own totals add up to the disc size it claims
+    bool fsmTotalsConsistent() const;
+
 private:
     // The free space map and root directory occupy the first seven ADFS sectors
     static const uint32_t METADATA_SECTORS = 7;

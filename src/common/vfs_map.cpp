@@ -134,6 +134,32 @@ bool VfsMap::directoryOk() const
     return m_directory && m_directory->isValid() && !m_directory->isBroken();
 }
 
+void VfsMap::extendImageSize(uint64_t imageSize)
+{
+    if (imageSize <= m_imageSize) return;
+
+    m_imageSize = imageSize;
+
+    // An object that ran off the end of the image may no longer do so
+    for (VfsObject &object : m_objects) {
+        object.extendsPastEndOfImage = (object.endOffset > m_imageSize);
+    }
+
+    LOG_DEBUG("VfsMap::extendImageSize() - The image is now {} bytes", m_imageSize);
+}
+
+bool VfsMap::fsmTotalsConsistent() const
+{
+    if (!m_fsm) return false;
+
+    // Free and used are derived from different parts of the map, so their sum
+    // agreeing with the disc size is a genuine cross-check
+    const uint64_t total =
+        static_cast<uint64_t>(m_fsm->freeSectors()) + static_cast<uint64_t>(m_fsm->usedSectors());
+
+    return total == static_cast<uint64_t>(m_discSectors);
+}
+
 SectorRole VfsMap::classify(uint32_t efmSector) const
 {
     const uint64_t efmStart = static_cast<uint64_t>(efmSector) * EFM_SECTOR_SIZE;

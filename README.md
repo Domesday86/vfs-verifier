@@ -235,7 +235,9 @@ vfs-stacker -o <output> <input> <input> [<input>...]
 
 - `-h, --help` - Display help information
 - `-o, --output <path>` - Output image; the merged bad sector map is written to `<path>.bsm`
-- `--consensus <n>` - Also accept a sector that *every* source flagged as bad when at least `n` sources hold byte-identical content for it (0, the default, disables this; the minimum useful value is 2)
+- `--consensus <n>` - Override the consensus rule, accepting a sector that *every* source flagged as bad when at least `n` sources hold byte-identical content for it (minimum 2, maximum the number of inputs). By default the requirement is a majority of the sources
+- `--no-consensus` - Never accept a sector that every source flagged as bad, however many sources agree on its content
+- `--no-pad` - Leave the output at the length the sources reached, instead of padding a short image out to the disc length the filesystem describes
 - `--dry-run` - Report what stacking would produce without writing anything
 - `--force` - Stack the sources even when the alignment cross-check says they do not agree
 - `--log-level <level>` - Console log level: `trace`, `debug`, `info` (default), `warn`, `error`, `critical`, `off`
@@ -297,32 +299,37 @@ The verdict at the end of the run is one of three:
      earliest source on the command line is written, and the sector is reported
      as a warning. Source order is the tie-break throughout, so putting the
      decode you trust most first makes it the arbiter.
-   - **Consensus** (only with `--consensus <n>`) - no source vouches for the
-     sector, but at least `n` of them hold byte-identical content for it, and
-     that content is not just padding. Independent decoders do not make the same
-     mistake twice, so the content is accepted despite the flags. Sectors that
-     are entirely one fill byte (`0x00`, `0x20` or `0xFF`) are never rescued this
-     way - agreement on padding says nothing about whether anything was
-     recovered.
+   - **Consensus** - no source vouches for the sector, but a majority of them
+     hold byte-identical content for it, and that content is not just padding.
+     Independent decoders do not arrive at the same 2048 bytes by accident, so
+     the content is accepted despite the flags. This is on by default; see
+     [Consensus recovery](#consensus-recovery) below. Sectors that are entirely
+     one fill byte (`0x00`, `0x20` or `0xFF`) are never rescued this way -
+     agreement on padding says nothing about whether anything was recovered.
    - **Unrecovered** - none of the above. The sector is listed in the output bad
      sector map. The output is the same length whatever happens, so it is filled
-     with the first source's copy that holds something other than padding, which
-     keeps whatever partial data survived available for inspection. That content
-     is flagged bad and must not be trusted.
+     with the content the most sources arrived at, ignoring any that hold nothing
+     but padding. Even where no source will vouch for a sector, content several
+     of them reached independently is a better guess than content only one of
+     them holds. That content is flagged bad and must not be trusted.
 4. **Read the filesystem** - The planned merge is parsed as an ADFS image without
    being written first: the `Hugo` signature is located and validated, and the
    free space map and root directory are read out of the merge exactly as
    vfs-verifier would read them from a file. This is the same code the verifier
    uses, so the two tools always agree about where the filesystem is and what it
    contains.
-5. **Classify what is left** - Every sector that is still bad is put into one of
+5. **Pad to the disc length** - The free space map says how many sectors the disc
+   holds, which is not always how many the captures reached. If the merge is
+   short, the tail is added as empty sectors so that the output is the length the
+   filesystem describes. See [Padding a short capture](#padding-a-short-capture).
+6. **Classify what is left** - Every sector that is still bad is put into one of
    six categories: within file data, filesystem metadata, allocated but belonging
    to no listed object, before the filesystem, free space, or past the end of the
    image. The first three are *vital* - something depends on them. The last three
    cost nothing. Vital sectors are listed as runs and named with the object they
    fall in, and each damaged object is reported with the number of bad EFM
    sectors, the bytes lost and the percentage left intact.
-6. **Report and write** - The output is summarised by how each sector was arrived
+7. **Report and write** - The output is summarised by how each sector was arrived
    at, by what each source contributed, and against the best that any single
    source could manage alone, and the run ends with the GOOD / INCOMPLETE /
    UNKNOWN verdict. Unless `--dry-run` was given, the image and its bad sector
@@ -338,6 +345,74 @@ The contribution table measures each source against the filesystem:
 - `VitalBad` - sectors the filesystem depends on that this source could not
   supply on its own, which is a fair measure of that decode's quality.
 
+### Consensus recovery
+
+A sector every source flagged as bad cannot be recovered by picking a source that
+vouches for it, because none does. But the sources still hold *content* for it,
+and a decoder that fails on a sector does not fail in the same way twice: two
+independent decodes landing on the same 2048 bytes is not a coincidence, it is
+the disc. So the stacker accepts such a sector when a **majority** of the sources
+that hold it are byte-identical, and that content is not just padding.
+
+This is on by default because the alternative is throwing away recovery the
+sources have already paid for. It is also the one place where the stacker
+overrules a decoder, so every recovery is accounted for in the report:
+
+- `Every source agreed` - not one source dissented. Beyond argument.
+- `Accepted on two sources` - the weakest evidence the stacker will act on, and
+  reported as a warning with the sectors named. With only two sources this is
+  every consensus recovery there is.
+- `Contested` - two or more sources held a *different* answer. That is not decode
+  noise, which is random; it is the sources disagreeing about what the disc says,
+  and it is worth confirming they really are the same disc.
+
+Use `--consensus <n>` to demand a fixed number of agreeing sources instead of a
+majority, or `--no-consensus` to switch it off and take the bad sector maps
+literally. When sectors the filesystem needs are still bad but do have agreement
+behind them, the INCOMPLETE verdict says how many and what threshold would take
+them, so the choice is an informed one rather than a guess.
+
+The independence this rests on cannot be verified, only estimated. Two sources
+whose bad sector maps are *identical* are almost certainly the same decode rather
+than two attempts, and the cross-check names them: such a pair adds nothing to
+the stack and makes sectors look better agreed-upon than they are.
+
+### Padding a short capture
+
+A capture that stopped before the end of the disc produces an image shorter than
+the disc it came from. That is not damage a bad sector map can express - those
+sectors are not bad, they are absent - and it leaves the file the wrong length
+even when everything in it is perfect. Discs like this are otherwise entirely
+valid: the tail is usually free space, so nothing is actually lost.
+
+The free space map states how many 256-byte sectors the disc holds, so the length
+the image *should* be is known:
+
+```
+sector 0 position + (sectors on the disc x 256), rounded up to a whole EFM sector
+```
+
+When the merge falls short of that, the stacker appends empty sectors to make up
+the difference. They are written as zeros and every one of them is listed in the
+output bad sector map, so nothing can mistake padding for recovered data: the
+role breakdown then says whether the missing tail was free space (harmless, and
+the verdict stays GOOD) or something the filesystem depended on (vital, and the
+verdict is INCOMPLETE). The report gives the captured length and the padded
+length separately.
+
+The length is only as trustworthy as the metadata it is read from, so padding is
+skipped, with a warning saying so, unless:
+
+- the `Hugo` signature passed full validation, **and**
+- the free space map's checksums hold, **and**
+- the free space map's own totals are self-consistent - free plus used has to
+  equal the disc size it claims.
+
+Padding never truncates. Sources that run *past* the declared end of the disc are
+left as they are and reported, on the grounds that unexplained run-out is better
+kept than thrown away. Use `--no-pad` to leave the output at whatever length the
+captures reached.
+
 ## Choosing sources
 
 - The sources must be decodes of the **same disc**, and must be aligned with each
@@ -351,6 +426,12 @@ The contribution table measures each source against the filesystem:
 - Damage common to every source cannot be stacked away. A run of sectors bad in
   all of them is either a defect shared by the pressing or a region the captures
   never reached, and no number of further copies of the same kind will fill it.
+  Consensus recovery is the one exception, and it only applies where the sources
+  hold matching content rather than matching noise.
+- Sources need not be the same length. The output takes the length of the longest
+  of them, extended to the disc length if the filesystem says the disc is longer
+  still, and a source that stopped early simply has nothing to offer past its
+  end. The contribution table charges it for the tail it never reached.
 
 ## Scope and limitations
 
@@ -366,11 +447,11 @@ The contribution table measures each source against the filesystem:
 - **Root directory only.** Like the verifier, the map covers the root directory;
   subdirectory contents show up as "allocated, not in any object", which is
   counted as vital but cannot be attributed to a named file.
-- **The bad sector map is the authority.** Except with `--consensus`, a sector is
-  taken from a source only when that source's map does not flag it. A sector the
-  decoder wrongly believed it recovered is copied through as good, and one it
-  wrongly condemned is not used. Undetected errors are beyond what a stacker can
-  see.
+- **The bad sector map is the authority.** Except in consensus recovery, a sector
+  is taken from a source only when that source's map does not flag it. A sector
+  the decoder wrongly believed it recovered is copied through as good, and one it
+  wrongly condemned is only reconsidered when the other sources agree with it.
+  Undetected errors are beyond what a stacker can see.
 - **The output is only as aligned as its inputs.** `--force` exists for cases
   where the operator knows better than the cross-check, and it removes the only
   protection against splicing unrelated data together.
